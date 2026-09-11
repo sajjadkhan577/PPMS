@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Petrol Pump Management System - User Guide</title>
+<style>
+  @page { size: A4; margin: 18mm 16mm; }
+  :root { color: #17202a; font-family: "Segoe UI", Arial, sans-serif; }
+  body { margin: 0; line-height: 1.45; font-size: 10.5pt; }
+  h1 { color: #173b5f; font-size: 26pt; margin: 0 0 8px; }
+  h2 { color: #173b5f; font-size: 16pt; border-bottom: 2px solid #d7e0e8; padding-bottom: 4px; margin: 22px 0 8px; page-break-after: avoid; }
+  h3 { color: #314d66; font-size: 12pt; margin: 14px 0 5px; page-break-after: avoid; }
+  p { margin: 5px 0 8px; }
+  ul, ol { margin-top: 4px; padding-left: 22px; }
+  li { margin: 3px 0; }
+  .cover { min-height: 245mm; display: flex; flex-direction: column; justify-content: center; page-break-after: always; }
+  .subtitle { font-size: 15pt; color: #526579; margin-bottom: 28px; }
+  .meta { border-left: 5px solid #d59a24; padding: 10px 14px; background: #f4f7f9; max-width: 550px; }
+  .note { background: #fff7df; border: 1px solid #e5c56d; padding: 10px 12px; margin: 10px 0; }
+  .warning { background: #fff0f0; border: 1px solid #ddaaaa; padding: 10px 12px; margin: 10px 0; }
+  .formula { background: #f1f5f8; border-left: 4px solid #173b5f; padding: 7px 10px; font-family: Consolas, monospace; margin: 7px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 7px 0 12px; font-size: 9.5pt; }
+  th, td { border: 1px solid #aab7c2; padding: 6px 7px; vertical-align: top; }
+  th { background: #eaf0f4; color: #173b5f; text-align: left; }
+  .small { color: #5a6975; font-size: 9pt; }
+  .page-break { page-break-before: always; }
+  code { font-family: Consolas, monospace; background: #f1f3f4; padding: 1px 3px; }
+</style>
+</head>
+<body>
+<section class="cover">
+  <h1>Petrol Pump Management System</h1>
+  <div class="subtitle">User Guide and Operational Overview</div>
+  <div class="meta">
+    <p><strong>Station:</strong> EKHWAN - 1 Filling Station</p>
+    <p><strong>System:</strong> PPMS local-first working register</p>
+    <p><strong>Purpose:</strong> Manage daily fuel station operations, sales, meter readings, customer udhar, purchases, expenses, mobile oil, commissions, closing, and summaries.</p>
+  </div>
+  <p class="small" style="margin-top:28px">Prepared for operator and management orientation</p>
+</section>
+
+<h2>1. Purpose of the System</h2>
+<p>The Petrol Pump Management System (PPMS) is designed for the daily management of a filling station. It follows a register-based petrol pump workflow instead of a generic inventory workflow.</p>
+<p>The system records fuel sales, pump readings, cash and credit transactions, customer balances, purchases, expenses, mobile oil sales, commission, safety readings, daily operations, reports, and accounting summaries.</p>
+<table><tr><th>Common terms</th><th>Meaning</th></tr><tr><td>HSD, PMG, XTRON</td><td>Fuel products sold by the station.</td></tr><tr><td>Udhar</td><td>Customer credit or outstanding amount.</td></tr><tr><td>Meter Reading</td><td>Reading recorded from a pump nozzle before and after a shift.</td></tr><tr><td>Daily Closing</td><td>End-of-day review of meters, sales, cash, expenses, and handover.</td></tr></table>
+
+<h2>2. Starting the Application</h2>
+<p>From the project directory, run:</p>
+<div class="formula">cd D:\PPMS<br>npm install<br>npm run dev</div>
+<p>Open the address shown by Vite, normally <code>http://localhost:5173</code>.</p>
+<p>To create a production web build, run <code>npm run build</code>. The output is placed in the <code>dist</code> folder.</p>
+
+<h2>3. Main Layout</h2>
+<ul><li><strong>Left navigation:</strong> opens each PPMS module.</li><li><strong>Top header:</strong> shows station identity and shortcuts for Daily Closing and Reports.</li><li><strong>Working Register heading:</strong> identifies the active module.</li><li><strong>Forms:</strong> enter operational transactions.</li><li><strong>Register tables:</strong> review saved records.</li><li><strong>Dashboard cards:</strong> show live totals from saved records.</li></ul>
+
+<h2>4. Dashboard</h2>
+<p>The Dashboard is the station manager's control screen. It shows live figures for the selected date range and shortcuts for common actions.</p>
+<ul><li><strong>Daily, Weekly, Monthly, Yearly:</strong> apply a date range to the dashboard figures.</li><li><strong>Custom:</strong> allows a From Date and To Date selection.</li><li><strong>Fuel Sales and Fuel Litres Sold:</strong> total fuel revenue and quantity for the selected range.</li><li><strong>Expenses, Credit Sales, Customer Payments, and Net Sales:</strong> financial totals filtered by the selected range.</li><li><strong>Current Receivables:</strong> current customer balances.</li><li><strong>Fuel Stock Overview:</strong> opening stock plus purchases minus sales and adjustments.</li></ul>
+<p>Quick actions open New Fuel Sale, Meter Reading, Customer Udhar, Expense, Fuel Purchase, Mobile Oil Sale, Daily Closing, and Reports.</p>
+
+<h2>5. Daily Operations</h2>
+<p>Use Daily Operations at the end of a day or shift. It summarizes meter readings, sales, expenses, cash sales, and provides a print option.</p>
+<h3>Recommended closing sequence</h3><ol><li>Enter all final pump meter readings.</li><li>Enter all fuel sales and credit sales.</li><li>Record customer payments and expenses.</li><li>Count physical cash.</li><li>Compare cash with the Cash Sales figure.</li><li>Review the Daily Operations screen.</li><li>Print the closing summary and complete shift handover.</li></ol>
+
+<h2>6. Meter Reading</h2>
+<p>Use this register for each nozzle and shift. The station is configured with four HSD nozzles and four PMG nozzles:</p>
+<ul><li><strong>HSD:</strong> HSD-1, HSD-2, HSD-3, HSD-4</li><li><strong>PMG:</strong> PMG-1, PMG-2, PMG-3, PMG-4</li></ul>
+<p>Select the date, shift, product, and nozzle, then enter the previous and present readings. The system checks that the nozzle belongs to the selected product.</p>
+<div class="formula">Total Litres = Present Reading - Previous Reading</div>
+<p>Example: present reading 12,500 minus previous reading 11,800 equals 700 litres.</p>
+<div class="note"><strong>Control:</strong> The system rejects a present reading that is lower than the previous reading.</div>
+<p>After saving, verify the entry in Meter Reading History.</p>
+
+<h2>7. Fuel Management</h2>
+<p>Fuel Management records tanker deliveries and fuel purchased from suppliers.</p>
+<p>Enter date, product, quantity in litres, purchase rate, and supplier.</p>
+<div class="formula">Purchase Amount = Quantity x Purchase Rate</div>
+<p>Record each tanker or delivery separately and keep the supplier name and invoice reference available.</p>
+<p>Administrators can use the <strong>Edit</strong> action in Fuel Stock / Litre Management to change a product's opening litres. The table recalculates Remaining immediately. The Admin-only <strong>Delete</strong> action clears that product's opening stock, fuel purchases, fuel sales, and stock adjustments after confirmation. Use this when preparing a clean test register; it is a destructive action.</p>
+
+<h2>8. Sales</h2>
+<p>The Sales module is the daily fuel sales register. Enter date, product, litres, selling rate, payment mode, and customer or party.</p>
+<div class="formula">Sale Amount = Litres x Sale Rate</div>
+<h3>Cash sale</h3><p>Select <strong>Cash</strong> when payment is received immediately. Use <code>-</code> for Customer / Party when no account is involved.</p>
+<h3>Credit sale / Udhar</h3><p>Select <strong>Credit</strong> when payment will be received later. Enter the customer or party name and maintain the customer ledger.</p>
+
+<h2>9. Customers</h2>
+<p>The Customer module has two separate parts: a Customer Master Record and an Udhar / Payment Transaction register. The master record keeps the person's name, phone, address, and opening balance. The transaction register stores each credit sale, payment received, and adjustment as a dated entry.</p>
+<div class="formula">Balance = Total Debit / Added - Total Credit / Cut</div>
+<p>Every credit fuel sale for a selected customer automatically posts an udhar transaction. Payments are entered with a receipt or reference number and reduce the customer's balance.</p>
+<p>The Daily Credited / Udhar Register shows all credit sales and payments for the selected day. Customer Statement by Date lets management select a customer and date, then review the complete history up to that date, including:</p>
+<ul><li>Opening balance</li><li>Credit sales added</li><li>Payments received and cut from the balance</li><li>Reference or receipt number</li><li>Description</li><li>Running balance after every transaction</li></ul>
+<div class="note"><strong>Important:</strong> Credit sales increase outstanding balance but are not physical cash received.</div>
+<p>Customers can be deleted from the Customer Register. Deleting a customer also removes that customer's udhar transactions, discount rules, and family adjustments. Review linked records before deleting.</p>
+
+<h2>10. Expenses</h2>
+<p>Record station operating costs on the day they occur. Available heads include Salary, Electricity, Repair, Transport, Shop Expense, and Other. Payment sources include Cash, Bank, and Owner.</p>
+<p>Enter date, expense head, description, amount, and payment source. Expenses reduce the Dashboard net cash figure.</p>
+
+<h2>11. Employee Salary Register</h2>
+<p>The Employee Salary Register is available in Reports and Accounting. Use it for employee-level payroll records rather than entering salary only as a general expense.</p>
+<p>Enter payment date, salary period, employee name, gross salary, deductions or advance, payment method, status, and notes.</p>
+<div class="formula">Net Salary = Gross Salary - Deductions / Advance</div>
+<p>The register displays salary history for the selected report period and allows individual salary records to be deleted. Salary data is included in application storage and backup files.</p>
+
+<h2>12. Mobile Oil</h2>
+<p>Use this register for non-fuel products such as Motor Oil 20W40, Motor Oil 20W50, Gear Oil, Coolant, and Grease.</p>
+<div class="formula">Mobile Oil Amount = Quantity x Sale Rate</div>
+<p>Enter date, product, quantity or packets, and sale rate. Keep mobile oil transactions separate from fuel transactions.</p>
+
+<h2>13. Commission</h2>
+<p>The Commission screen summarizes estimated commission by product based on litres sold.</p>
+<table><tr><th>Product</th><th>Example rate</th></tr><tr><td>PMG</td><td>2.5%</td></tr><tr><td>HSD</td><td>2.2%</td></tr><tr><td>XTRON</td><td>2.5%</td></tr></table>
+<div class="formula">Commission = Litres Sold x Commission Rate</div>
+<p>Confirm the actual rates against the station agreement before official financial use.</p>
+
+<h2>14. Safety Duty</h2>
+<p>The Safety Duty register currently summarizes duty points using present and previous readings. It can be extended for extinguisher checks, emergency shutoff, generator checks, spill kits, hose condition, and staff safety signatures.</p>
+
+<h2>15. Reports and Accounting</h2>
+<p>Reports and Accounting summarize saved registers such as Fuel Sales, Fuel Purchases, Mobile Oil Sales, and Expenses. The browser print function can print the current view or save it as PDF.</p>
+<p>The Report Period control supports Today, This Week, This Month, This Year, and Custom. The same date range filters the report totals, BRS detail, family adjustments, and employee salary history.</p>
+<p><strong>Family Adjustment:</strong> record increases or decreases for a family or customer account. Each saved adjustment can be deleted from the Family Adjustment Register. Family adjustments are maintained as their own register and should be reviewed with the customer ledger.</p>
+<p><strong>Bank Reconciliation (BRS):</strong> record bank deposits or withdrawals, book amount, bank amount, adjustment, status, and reference. The BRS summary shows book transactions, matched transactions, and difference.</p>
+<p>The calculation engine supports fuel revenue, mobile oil revenue, other income, fuel purchases, mobile oil purchases, commission, salaries, electricity, pump expenses, and other expenses.</p>
+<div class="formula">Gross Revenue = Fuel Revenue + Mobile Oil Revenue + Other Income<br>Total Cost = Fuel Purchase + Mobile Oil Purchase + Operating Costs<br>Gross Profit = Gross Revenue - Total Cost</div>
+
+<h2>16. Settings</h2>
+<p>Administrators can create user accounts and assign the Admin, Manager, or Operator role. Settings also contains data backup and restore, payment fee configuration, and bank reconciliation.</p>
+<h3>Roles</h3>
+<table><tr><th>Role</th><th>Access</th></tr><tr><td><strong>Admin</strong></td><td>Full access to operational registers, accounting settings, user creation, backups, and register reset.</td></tr><tr><td><strong>Manager</strong></td><td>Can run operational registers and update station data. Cannot create or manage user accounts.</td></tr><tr><td><strong>Operator</strong></td><td>Can record daily operational data. Settings are hidden, and payment fees, bank accounts, and BRS records cannot be modified.</td></tr></table>
+<h3>Backup and reset</h3>
+<p><strong>Download Backup</strong> creates a JSON backup of the register data. <strong>Restore Backup</strong> restores register data from a compatible JSON file.</p>
+<p><strong>Reset Register Data</strong> is an Admin-only destructive action. It clears operational registers, including customers, sales, udhar, expenses, purchases, meters, stock, accounting records, family adjustments, and salaries. It does not delete user accounts. A confirmation is required.</p>
+
+<h2>17. Recommended Daily Workflow</h2>
+<h3>Opening</h3><ol><li>Confirm station date and opening cash.</li><li>Review previous meter readings.</li><li>Confirm fuel rates.</li><li>Check fuel and mobile oil stock.</li><li>Confirm shift and staff assignment.</li></ol>
+<h3>During operations</h3><ol><li>Record meter readings at shift times.</li><li>Record every fuel sale.</li><li>Mark Cash and Credit correctly.</li><li>Record customer names for udhar.</li><li>Record customer payments and expenses.</li><li>Record tanker purchases and mobile oil sales.</li></ol>
+<h3>Closing</h3><ol><li>Enter final readings.</li><li>Compare pump litres with sales litres.</li><li>Confirm credit sales and payments.</li><li>Count cash and compare with the system.</li><li>Review Daily Operations and print the summary.</li><li>Complete shift handover.</li></ol>
+
+<h2>18. Staff Controls</h2>
+<ul><li>Never guess a meter reading.</li><li>Do not mark a credit sale as cash.</li><li>Always enter the customer for udhar.</li><li>Record expenses on the same day.</li><li>Do not mix mobile oil and fuel sales.</li><li>Check the selling rate before saving.</li><li>Verify the confirmation message and register row.</li><li>Preserve daily closing records.</li></ul>
+
+<h2>19. Storage and Production Notes</h2>
+<p>PPMS uses browser <code>localStorage</code> as a local-first working register. When a user signs in, register state is synchronized with the SQLite API at <code>http://localhost:8787</code>. The API stores hashed passwords, sessions, role checks, register state, and audit records.</p>
+<div class="warning"><strong>Production warning:</strong> Set <code>PPMS_ADMIN_PASSWORD</code> before production use, keep regular backups, restrict access to the SQLite database, and review audit records. Offline mode is intended for local testing and does not provide server-side audit enforcement.</div>
+<p>Stored areas include meter readings, sales, customers, udhar transactions, expenses, employee salaries, purchases, mobile oil sales, discount rules, payment fees, stock adjustments, bank accounts, BRS records, and family adjustments.</p>
+
+<h2>20. System Status</h2>
+<table><tr><th>Working</th><th>Operational limitations</th></tr><tr><td>Navigation and module screens<br>Fuel sales and credit postings<br>Meter readings<br>Automatic calculations<br>Customer balances<br>Customer and family-adjustment deletion<br>Expenses and employee salaries<br>Fuel purchases and stock adjustments<br>Mobile oil<br>Commission and safety summaries<br>Dashboard and report date ranges<br>SQLite persistence and browser fallback<br>Roles and permissions<br>Backup and restore<br>Printing and CSV export</td><td>Daily closing is a review workflow rather than a locked accounting period.<br>Some register deletes are direct record deletion and should be used carefully.<br>Offline mode bypasses server synchronization and audit logging.<br>Review backup files and access controls before live financial deployment.</td></tr></table>
+
+<p class="small">This guide describes the current PPMS working version and is intended for operator orientation and management review.</p>
+</body>
+</html>
