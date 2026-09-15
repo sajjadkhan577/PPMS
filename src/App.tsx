@@ -1,13 +1,13 @@
 import { FormEvent, ReactNode, useEffect, useMemo, useState } from 'react'
 import './styles.css'
-import { calculateDiscountAmount, calculateFuelStockSummary, calculatePaymentFee, getDashboardSummary } from './lib/ppms'
+import { calculateCommissionAmount, calculateDiscountAmount, calculateFuelStockSummary, calculatePaymentFee, getCommissionTotal, getDashboardSummary } from './lib/ppms'
 import { createBackup, readStored, restoreBackup, writeStored } from './lib/storage'
 
 type Product = 'HSD' | 'PMG' | 'XTRON'
 type DiscountType = 'percent' | 'fixed'
 type PaymentMethod = 'Cash' | 'Card' | 'Credit Card' | 'Debit Card' | 'Bank Transfer' | 'Online Payment' | 'Other'
 
-type MeterReading = { id: number; date: string; shift: string; nozzle: string; product: Product; previous: number; present: number; litres: number }
+type MeterReading = { id: number; date: string; shift: string; nozzle: string; product: Product; previous: number; present: number; litres: number; rate?: number; amount?: number }
 type Sale = {
   id: number
   date: string
@@ -31,6 +31,7 @@ type Expense = { id: number; date: string; category: string; description: string
 type EmployeeSalary = { id: number; date: string; period: string; employee: string; gross: number; deductions: number; net: number; paidBy: string; status: 'Paid' | 'Pending'; notes: string }
 type Purchase = { id: number; date: string; product: Product; litres: number; rate: number; supplier: string; amount: number }
 type OilSale = { id: number; date: string; item: string; quantity: number; rate: number; amount: number }
+type CommissionRecord = { id: number; date: string; product: Product; eligibleLitres: number; commissionableLitres: number; rate: number; amount: number; reference: string; notes: string }
 type DiscountRule = {
   id: number
   customerId?: number
@@ -68,10 +69,12 @@ type BankAccount = {
   accountNumber: string
   openingBalance: number
   currentBookBalance: number
+  active?: boolean
 }
 type BRSRecord = {
   id: number
   bankAccountId: number
+  legacyBankName?: string
   date: string
   description: string
   type: 'Deposit' | 'Withdrawal'
@@ -80,6 +83,7 @@ type BRSRecord = {
   reference: string
   bankAmount?: number
   adjustment?: number
+  difference?: number
 }
 type FamilyAdjustment = {
   id: number
@@ -92,19 +96,33 @@ type FamilyAdjustment = {
   notes: string
 }
 type SessionUser = { id: string; username: string; role: 'admin' | 'manager' | 'operator' }
+type PrintDocumentRequest = { title: string; period: string }
+type SystemStatus = { version: string; databasePath: string; backupDir: string; databaseExists: boolean }
+type BackupInfo = { name: string; createdAt: string; modifiedAt: string; size: number }
+
+function clearLaunchSession() {
+  localStorage.removeItem('ppms-session-token')
+  localStorage.removeItem('ppms-session-user')
+}
 
 const tabs = ['Dashboard', 'Daily Operations', 'Meter Reading', 'Fuel Management', 'Sales', 'Customers', 'Expenses', 'Mobile Oil', 'Commission', 'Safety Duty', 'Reports', 'Accounting', 'Settings']
 const products: Product[] = ['HSD', 'PMG', 'XTRON']
-const productNozzles: Record<Product, string[]> = { HSD: ['HSD-1', 'HSD-2', 'HSD-3', 'HSD-4'], PMG: ['PMG-1', 'PMG-2', 'PMG-3', 'PMG-4'], XTRON: [] }
+const productNozzles: Record<Product, string[]> = { HSD: ['HSD-1', 'HSD-2', 'HSD-3', 'HSD-4'], PMG: ['PMG-1', 'PMG-2', 'PMG-3', 'PMG-4'], XTRON: ['XTRON-1', 'XTRON-2', 'XTRON-3'] }
 const DEFAULT_STOCK: Record<Product, number> = { HSD: 20000, PMG: 15000, XTRON: 5000 }
-const today = '2026-09-09'
 
-const initialMeters: MeterReading[] = [
-  { id: 1, date: today, shift: 'Day', nozzle: 'HSD-1', product: 'HSD', previous: 11800, present: 12500, litres: 700 },
-  { id: 2, date: today, shift: 'Day', nozzle: 'HSD-2', product: 'HSD', previous: 12100, present: 12800, litres: 700 },
-  { id: 3, date: today, shift: 'Day', nozzle: 'PMG-1', product: 'PMG', previous: 11350, present: 11980, litres: 630 },
-  { id: 4, date: today, shift: 'Day', nozzle: 'PMG-2', product: 'PMG', previous: 11490, present: 12120, litres: 630 },
-]
+function getSystemDate() {
+  const now = new Date()
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+}
+
+const today = getSystemDate()
+
+function displayDate(value: string) {
+  const date = new Date(`${value}T00:00:00`)
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' })
+}
+
+const initialMeters: MeterReading[] = []
 const initialSales: Sale[] = [
   { id: 1, date: today, product: 'HSD', litres: 3080, rate: 285, amount: 877800, mode: 'Cash', customer: '-', discountAmount: 0 },
   { id: 2, date: today, product: 'PMG', litres: 1420, rate: 280, amount: 397600, mode: 'Credit', customer: 'Al-Rehman Transport', customerId: 1, discountAmount: 0 },
@@ -131,7 +149,7 @@ const defaultPaymentFees: PaymentFeeSetting[] = [
   { id: 2, method: 'Online Payment', feePercent: 2.5, effectiveDate: today, status: 'Active', absorbedByBusiness: true },
 ]
 const defaultBankAccounts: BankAccount[] = [
-  { id: 1, bankName: 'HBL', accountName: 'EKHWAN-1 Depot', accountNumber: 'PK-001-454', openingBalance: 1200000, currentBookBalance: 1250000 },
+  { id: 1, bankName: 'HBL', accountName: 'EKHWAN-1 Depot', accountNumber: 'PK-001-454', openingBalance: 1200000, currentBookBalance: 1250000, active: true },
 ]
 const defaultBRS: BRSRecord[] = [
   { id: 1, bankAccountId: 1, date: today, description: 'Bank deposit', type: 'Deposit', amount: 250000, status: 'Matched', reference: 'DEP-001' },
@@ -155,6 +173,7 @@ const STORAGE_KEYS = [
   'ppms-brs-records',
   'ppms-family-adjustments',
   'ppms-employee-salaries',
+  'ppms-commission-records',
   'ppms-stock-openings',
 ]
 
@@ -190,24 +209,97 @@ function useStored<T>(key: string, initial: T, normalize: (value: unknown) => T 
 }
 
 function LoginPanel({ onLogin, error }: { onLogin: (username: string, password: string) => void; error: string }) {
-  return <main className="login-panel"><div className="login-card"><span className="brand-mark">A</span><p className="eyebrow">Petrol Pump Management System</p><h1>Operator Sign In</h1><p>Use an authenticated PPMS account to access station registers.</p><form onSubmit={(event) => { event.preventDefault(); const data = new FormData(event.currentTarget); onLogin(String(data.get('username')), String(data.get('password'))) }}><label className="form-field"><span>Username</span><input name="username" autoComplete="username" required /></label><label className="form-field"><span>Password</span><input name="password" type="password" autoComplete="current-password" required /></label>{error && <p className="form-error">{error}</p>}<button className="primary-button" type="submit">Sign In</button></form><button className="ghost-button" type="button" onClick={() => onLogin('offline', 'offline')}>Continue Offline</button></div></main>
+  return <main className="login-panel"><div className="login-card"><span className="brand-mark">A</span><p className="eyebrow">Petrol Pump Management System</p><h1>Operator Sign In</h1><p>Use an authenticated PPMS account to access station registers.</p><form onSubmit={(event) => { event.preventDefault(); const data = new FormData(event.currentTarget); onLogin(String(data.get('username')), String(data.get('password'))) }}><label className="form-field"><span>Username</span><input name="username" autoComplete="username" required /></label><label className="form-field"><span>Password</span><input name="password" type="password" autoComplete="current-password" required /></label>{error && <p className="form-error">{error}</p>}<button className="primary-button" type="submit">Sign In</button></form></div></main>
 }
 
 const money = (value: number) => `Rs. ${Math.round(value).toLocaleString('en-PK')}`
-const numberValue = (value: FormDataEntryValue | null) => Number(value || 0)
+const printMoney = (value: number) => `Rs. ${value.toLocaleString('en-PK', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+const numberValue = (value: FormDataEntryValue | null) => Number(value) || 0
 
-function resolveDateRange(period: string, customFrom: string, customTo: string) {
-  if (period === 'Today') return { from: today, to: today }
+function normalizeBankAccounts(value: unknown): BankAccount[] {
+  if (!Array.isArray(value)) return defaultBankAccounts
+  return value.map((item) => {
+    const account = item as Partial<BankAccount>
+    return {
+      id: Number(account.id),
+      bankName: String(account.bankName || ''),
+      accountName: String(account.accountName || ''),
+      accountNumber: String(account.accountNumber || ''),
+      openingBalance: Number(account.openingBalance || 0),
+      currentBookBalance: Number(account.currentBookBalance || 0),
+      active: account.active !== false,
+    }
+  }).filter((account) => Number.isFinite(account.id) && account.bankName && account.accountName)
+}
+
+function normalizeBRSRecords(value: unknown): BRSRecord[] {
+  if (!Array.isArray(value)) return defaultBRS
+  return value.map((item) => {
+    const record = item as Partial<BRSRecord> & { bank?: string; bankName?: string }
+    const bankAccountId = Number(record.bankAccountId)
+    return {
+      id: Number(record.id),
+      bankAccountId: Number.isFinite(bankAccountId) ? bankAccountId : 0,
+      legacyBankName: record.legacyBankName || record.bank || record.bankName,
+      date: String(record.date || ''),
+      description: String(record.description || ''),
+      type: record.type === 'Withdrawal' ? 'Withdrawal' : 'Deposit',
+      amount: Number(record.amount || 0),
+      status: record.status || 'Pending',
+      reference: String(record.reference || ''),
+      bankAmount: Number(record.bankAmount || 0),
+      adjustment: Number(record.adjustment || 0),
+      difference: typeof record.difference === 'number' ? record.difference : Number(record.amount || 0) - Number(record.bankAmount || 0),
+    }
+  })
+}
+
+function normalizeCommissionRecords(value: unknown): CommissionRecord[] {
+  if (!Array.isArray(value)) return []
+  return value.map((item) => {
+    const record = item as Partial<CommissionRecord> & { fuelType?: Product; litres?: number; commissionAmount?: number; commissionRate?: number }
+    const commissionableLitres = Number(record.commissionableLitres ?? record.litres ?? 0)
+    const rate = Number(record.rate ?? record.commissionRate ?? 0)
+    return {
+      id: Number(record.id),
+      date: String(record.date || ''),
+      product: (record.product || record.fuelType || 'HSD') as Product,
+      eligibleLitres: Number(record.eligibleLitres ?? commissionableLitres),
+      commissionableLitres,
+      rate,
+      amount: Number(record.amount ?? record.commissionAmount ?? commissionableLitres * rate),
+      reference: String(record.reference || ''),
+      notes: String(record.notes || ''),
+    }
+  }).filter((record) => Number.isFinite(record.id) && products.includes(record.product))
+}
+
+function resolveDateRange(period: string, customFrom: string, customTo: string, currentDate = getSystemDate()) {
+  if (period === 'Today') return { from: currentDate, to: currentDate }
+  if (period === 'Yesterday') {
+    const yesterday = new Date(`${currentDate}T00:00:00`)
+    yesterday.setDate(yesterday.getDate() - 1)
+    const date = `${yesterday.getFullYear()}-${String(yesterday.getMonth() + 1).padStart(2, '0')}-${String(yesterday.getDate()).padStart(2, '0')}`
+    return { from: date, to: date }
+  }
   if (period === 'This Week') {
-    const current = new Date(`${today}T00:00:00`)
+    const current = new Date(`${currentDate}T00:00:00`)
     const day = current.getDay()
     const diff = (day === 0 ? 6 : day - 1)
     current.setDate(current.getDate() - diff)
-    return { from: current.toISOString().slice(0, 10), to: today }
+    return { from: `${current.getFullYear()}-${String(current.getMonth() + 1).padStart(2, '0')}-${String(current.getDate()).padStart(2, '0')}`, to: currentDate }
   }
-  if (period === 'This Month') return { from: `${today.slice(0, 7)}-01`, to: today }
-  if (period === 'This Year') return { from: `${today.slice(0, 4)}-01-01`, to: today }
-  return { from: customFrom || today, to: customTo || today }
+  if (period === 'This Month') return { from: `${currentDate.slice(0, 7)}-01`, to: currentDate }
+  if (period === 'Last Month') {
+    const first = new Date(`${currentDate.slice(0, 7)}-01T00:00:00`)
+    first.setMonth(first.getMonth() - 1)
+    const month = `${first.getFullYear()}-${String(first.getMonth() + 1).padStart(2, '0')}`
+    const last = new Date(`${currentDate.slice(0, 7)}-01T00:00:00`)
+    last.setDate(0)
+    return { from: `${month}-01`, to: `${month}-${String(last.getDate()).padStart(2, '0')}` }
+  }
+  if (period === 'This Year') return { from: `${currentDate.slice(0, 4)}-01-01`, to: currentDate }
+  return { from: customFrom || currentDate, to: customTo || currentDate }
 }
 
 function Field({ label, name, type = 'text', defaultValue, options, required = true }: { label: string; name: string; type?: string; defaultValue?: string | number; options?: string[]; required?: boolean }) {
@@ -249,6 +341,16 @@ function DataTable({ headers, rows, empty = 'No entries recorded yet.', actions 
   )
 }
 
+function PrintDocument({ request, rows, headers, summary, signatures = true }: { request: PrintDocumentRequest; rows: (string | number)[][]; headers: string[]; summary?: [string, string][]; signatures?: boolean }) {
+  return <section className="print-document">
+    <header className="print-header"><h1>EKHWAN - 1 FILLING STATION</h1><p>Petrol Pump Management System</p><div className="print-rule" /><h2>{request.title}</h2><p>Period: {request.period}</p><p>Generated: {new Date().toLocaleString('en-GB')}</p></header>
+    <table><thead><tr>{headers.map((header) => <th key={header}>{header}</th>)}</tr></thead><tbody>{rows.length ? rows.map((row, rowIndex) => <tr key={`print-row-${rowIndex}`}>{row.map((cell, cellIndex) => <td key={`print-cell-${rowIndex}-${cellIndex}`}>{cell}</td>)}</tr>) : <tr><td colSpan={headers.length} className="empty-cell">No transactions found for the selected period.</td></tr>}</tbody></table>
+    {summary && <section className="print-summary"><h3>Summary</h3>{summary.map(([label, value]) => <p key={label}><strong>{label}</strong><span>{value}</span></p>)}</section>}
+    {signatures && <footer className="print-signatures"><div>Prepared By<br /><span>________________</span><br />Signature</div><div>Shift Manager<br /><span>________________</span><br />Signature</div><div>Verified By<br /><span>________________</span><br />Signature</div></footer>}
+    <footer className="print-footer">Generated by Petrol Pump Management System</footer>
+  </section>
+}
+
 function customerBalance(customerId: number, customers: Customer[], transactions: UdharTransaction[]) {
   const customer = customers.find((item) => item.id === customerId)
   const entries = transactions.filter((item) => item.customerId === customerId)
@@ -258,9 +360,15 @@ function customerBalance(customerId: number, customers: Customer[], transactions
 }
 
 export default function App() {
-  const [authUser, setAuthUser] = useState<SessionUser | null>(() => { const saved = localStorage.getItem('ppms-session-user'); return saved ? JSON.parse(saved) as SessionUser : null })
+  const [authUser, setAuthUser] = useState<SessionUser | null>(null)
   const [authError, setAuthError] = useState('')
   const [selectedTab, setSelectedTab] = useState('Dashboard')
+  const [selectedSafetyProduct, setSelectedSafetyProduct] = useState<Product | null>(null)
+  const [safetySummaryView, setSafetySummaryView] = useState<'Daily' | 'Weekly'>('Daily')
+  const [safetySummaryPeriod, setSafetySummaryPeriod] = useState('This Week')
+  const [safetySummaryFrom, setSafetySummaryFrom] = useState(today)
+  const [safetySummaryTo, setSafetySummaryTo] = useState(today)
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
   const [meters, setMeters] = useStored<MeterReading[]>('meters', initialMeters)
   const [sales, setSales] = useStored<Sale[]>('sales', initialSales)
   const [customers, setCustomers] = useStored<Customer[]>('customers', initialCustomers, (value) => Array.isArray(value) ? value.map((item) => {
@@ -271,11 +379,12 @@ export default function App() {
   const [expenses, setExpenses] = useStored<Expense[]>('expenses', [])
   const [purchases, setPurchases] = useStored<Purchase[]>('purchases', [])
   const [oilSales, setOilSales] = useStored<OilSale[]>('oil-sales', [])
+  const [commissionRecords, setCommissionRecords] = useStored<CommissionRecord[]>('commission-records', [], normalizeCommissionRecords)
   const [discountRules, setDiscountRules] = useStored<DiscountRule[]>('discount-rules', defaultDiscountRules)
   const [paymentFees, setPaymentFees] = useStored<PaymentFeeSetting[]>('payment-fees', defaultPaymentFees)
   const [stockAdjustments, setStockAdjustments] = useStored<StockAdjustment[]>('stock-adjustments', [])
-  const [bankAccounts, setBankAccounts] = useStored<BankAccount[]>('bank-accounts', defaultBankAccounts)
-  const [brsRecords, setBrsRecords] = useStored<BRSRecord[]>('brs-records', defaultBRS)
+  const [bankAccounts, setBankAccounts] = useStored<BankAccount[]>('bank-accounts', defaultBankAccounts, normalizeBankAccounts)
+  const [brsRecords, setBrsRecords] = useStored<BRSRecord[]>('brs-records', defaultBRS, normalizeBRSRecords)
   const [familyAdjustments, setFamilyAdjustments] = useStored<FamilyAdjustment[]>('family-adjustments', defaultFamilyAdjustments)
   const [employeeSalaries, setEmployeeSalaries] = useStored<EmployeeSalary[]>('employee-salaries', [])
   const [stockOpenings, setStockOpenings] = useStored<Record<Product, number>>('stock-openings', defaultStockOpenings)
@@ -293,11 +402,83 @@ export default function App() {
   const [reportPeriod, setReportPeriod] = useState('This Month')
   const [reportCustomFrom, setReportCustomFrom] = useState(`${today.slice(0, 7)}-01`)
   const [reportCustomTo, setReportCustomTo] = useState(today)
+  const [selectedReport, setSelectedReport] = useState('Daily Sales')
   const [users, setUsers] = useState<SessionUser[]>([])
   const [recordSearch, setRecordSearch] = useState('')
+  const [currentSystemDate, setCurrentSystemDate] = useState(getSystemDate)
+  const [brsBankFilter, setBrsBankFilter] = useState('all')
+  const [brsBookAmount, setBrsBookAmount] = useState('0')
+  const [brsBankAmount, setBrsBankAmount] = useState('0')
+  const [commissionPreviewDate, setCommissionPreviewDate] = useState(today)
+  const [commissionPreviewProduct, setCommissionPreviewProduct] = useState<Product>('HSD')
+  const [commissionPreviewLitres, setCommissionPreviewLitres] = useState('0')
+  const [commissionPreviewRate, setCommissionPreviewRate] = useState('0')
+  const [printRequest, setPrintRequest] = useState<PrintDocumentRequest | null>(null)
+  const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null)
+  const [backups, setBackups] = useState<BackupInfo[]>([])
+  const [showChangePassword, setShowChangePassword] = useState(false)
+  const [changePasswordError, setChangePasswordError] = useState('')
+  const [changePasswordSuccess, setChangePasswordSuccess] = useState(false)
+  const [changePasswordOld, setChangePasswordOld] = useState('')
+  const [changePasswordNew, setChangePasswordNew] = useState('')
+  const [changePasswordConfirm, setChangePasswordConfirm] = useState('')
+  const [showOldPassword, setShowOldPassword] = useState(false)
+  const [showNewPassword, setShowNewPassword] = useState(false)
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false)
+
+  useEffect(() => {
+    clearLaunchSession()
+  }, [])
+
+  useEffect(() => {
+    if (!authUser || !localStorage.getItem('ppms-session-token')) return
+    const loadSystem = () => {
+      apiRequest<SystemStatus>('/api/system/status').then(setSystemStatus).catch(() => undefined)
+      apiRequest<{ backups: BackupInfo[] }>('/api/system/backups').then((payload) => setBackups(payload.backups)).catch(() => undefined)
+    }
+    loadSystem()
+    const lastBackup = localStorage.getItem('ppms-last-auto-backup')
+    if (authUser.role === 'admin' && lastBackup !== currentSystemDate) {
+      apiRequest<{ name: string }>('/api/system/backup', { method: 'POST' }).then(() => localStorage.setItem('ppms-last-auto-backup', currentSystemDate)).catch(() => undefined)
+    }
+  }, [authUser, currentSystemDate])
+
+  useEffect(() => {
+    const refreshSystemDate = () => {
+      const nextDate = getSystemDate()
+      setCurrentSystemDate((current) => current === nextDate ? current : nextDate)
+    }
+    refreshSystemDate()
+    const timer = window.setInterval(refreshSystemDate, 60_000)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  useEffect(() => {
+    if (!printRequest) return
+    const originalTitle = document.title
+    document.title = `EKHWAN-1 - ${printRequest.title} - ${printRequest.period}`
+    const restore = () => {
+      document.title = originalTitle
+      setPrintRequest(null)
+    }
+    window.addEventListener('afterprint', restore, { once: true })
+    const timer = window.setTimeout(() => window.print(), 0)
+    return () => {
+      window.clearTimeout(timer)
+      window.removeEventListener('afterprint', restore)
+      document.title = originalTitle
+    }
+  }, [printRequest])
+
+  const printDocument = (title: string, period = displayDate(currentSystemDate)) => setPrintRequest({ title, period })
+  const backupDatabase = () => apiRequest<{ name: string }>('/api/system/backup', { method: 'POST' }).then((payload) => { flash(`Database backup created: ${payload.name}`); return apiRequest<{ backups: BackupInfo[] }>('/api/system/backups') }).then((payload) => setBackups(payload.backups)).catch((error: Error) => flash(error.message))
+  const restoreDatabase = (name: string) => {
+    if (!window.confirm(`Restore ${name}? A safety backup will be created first.`)) return
+    apiRequest<{ restored: string; safetyBackup: string }>('/api/system/restore', { method: 'POST', body: JSON.stringify({ name }) }).then((payload) => { flash(`Database restored. Safety backup: ${payload.safetyBackup}`); window.setTimeout(() => window.location.reload(), 500) }).catch((error: Error) => flash(error.message))
+  }
 
   const flash = (message: string) => { setNotice(message); window.setTimeout(() => setNotice(''), 2600) }
-  const go = (tab: string) => { setSelectedTab(tab); setNotice('') }
+  const go = (tab: string) => { setSelectedTab(tab); setNotice(''); setMobileMenuOpen(false) }
   const customerName = (id: number) => customers.find((customer) => customer.id === id)?.name || 'Unknown customer'
   const downloadBackup = () => {
     const blob = new Blob([createBackup(localStorage, STORAGE_KEYS)], { type: 'application/json' })
@@ -324,6 +505,7 @@ export default function App() {
     setExpenses([])
     setPurchases([])
     setOilSales([])
+    setCommissionRecords([])
     setDiscountRules([])
     setPaymentFees([])
     setStockAdjustments([])
@@ -336,13 +518,6 @@ export default function App() {
     flash('All register data was reset. User accounts were kept.')
   }
   const login = (username: string, password: string) => {
-    if (username === 'offline' && password === 'offline') {
-      const offlineUser: SessionUser = { id: 'offline', username: 'Offline Manager', role: 'manager' }
-      setAuthUser(offlineUser)
-      localStorage.setItem('ppms-session-user', JSON.stringify(offlineUser))
-      setAuthError('')
-      return
-    }
     apiRequest<{ token: string; user: SessionUser }>('/api/auth/login', { method: 'POST', body: JSON.stringify({ username, password }) }).then((payload) => {
       localStorage.setItem('ppms-session-token', payload.token)
       localStorage.setItem('ppms-session-user', JSON.stringify(payload.user))
@@ -356,19 +531,53 @@ export default function App() {
     localStorage.removeItem('ppms-session-user')
     setAuthUser(null)
   }
+  const handleChangePassword = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setChangePasswordError('')
+    if (!changePasswordNew) { setChangePasswordError('Please enter a new password.'); return }
+    if (changePasswordNew.length < 8) { setChangePasswordError('Password does not meet the required security requirements.'); return }
+    if (changePasswordNew !== changePasswordConfirm) { setChangePasswordError('New passwords do not match.'); return }
+    if (changePasswordNew === changePasswordOld) { setChangePasswordError('New password must be different from the current password.'); return }
+    apiRequest('/api/auth/change-password', { method: 'POST', body: JSON.stringify({ oldPassword: changePasswordOld, newPassword: changePasswordNew, confirmPassword: changePasswordConfirm }) }).then(() => {
+      setChangePasswordSuccess(true)
+      setTimeout(() => {
+        if (localStorage.getItem('ppms-session-token')) apiRequest('/api/auth/logout', { method: 'POST' }).catch(() => undefined)
+        localStorage.removeItem('ppms-session-token')
+        localStorage.removeItem('ppms-session-user')
+        setAuthUser(null)
+        setShowChangePassword(false)
+        setChangePasswordOld('')
+        setChangePasswordNew('')
+        setChangePasswordConfirm('')
+        setChangePasswordSuccess(false)
+        setChangePasswordError('')
+      }, 1500)
+    }).catch((error: Error) => setChangePasswordError(error.message))
+  }
   const loadUsers = () => { if (authUser?.role === 'admin') apiRequest<{ users: SessionUser[] }>('/api/users').then((payload) => setUsers(payload.users)).catch(() => undefined) }
   const saveUser = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const data = new FormData(event.currentTarget)
     apiRequest('/api/users', { method: 'POST', body: JSON.stringify({ username: data.get('username'), password: data.get('password'), role: data.get('role') }) }).then(() => { event.currentTarget.reset(); loadUsers(); flash('User account created.') }).catch((error: Error) => flash(error.message))
   }
-  const reportRange = useMemo(() => resolveDateRange(reportPeriod, reportCustomFrom, reportCustomTo), [reportCustomFrom, reportCustomTo, reportPeriod])
-  const filteredSales = sales.filter((sale) => sale.date >= reportRange.from && sale.date <= reportRange.to)
+  const reportRange = useMemo(() => resolveDateRange(reportPeriod, reportCustomFrom, reportCustomTo, currentSystemDate), [currentSystemDate, reportCustomFrom, reportCustomTo, reportPeriod])
+  const meterSales = useMemo<Sale[]>(() => meters.filter((meter) => meter.product === 'XTRON' && meter.rate !== undefined).map((meter) => ({ id: -meter.id, date: meter.date, product: meter.product, litres: meter.litres, rate: meter.rate || 0, amount: meter.amount ?? meter.litres * (meter.rate || 0), mode: 'Cash', customer: '-', discountAmount: 0 })), [meters])
+  const fuelSales = useMemo(() => [...sales, ...meterSales], [meterSales, sales])
+  const eligibleLitresFor = (date: string, product: Product, excludeId?: number) => fuelSales.filter((sale) => sale.date === date && sale.product === product).reduce((sum, sale) => sum + sale.litres, 0)
+  const commissionedLitresFor = (date: string, product: Product, excludeId?: number) => commissionRecords.filter((record) => record.id !== excludeId && record.date === date && record.product === product).reduce((sum, record) => sum + record.commissionableLitres, 0)
+  const remainingEligibleLitresFor = (date: string, product: Product, excludeId?: number) => Math.max(0, eligibleLitresFor(date, product, excludeId) - commissionedLitresFor(date, product, excludeId))
+  const commissionRangeRecords = commissionRecords.filter((record) => record.date >= reportRange.from && record.date <= reportRange.to)
+  const commissionAmountForRange = getCommissionTotal({ startDate: reportRange.from, endDate: reportRange.to, records: commissionRecords })
+  const commissionLitresForRange = commissionRangeRecords.reduce((sum, record) => sum + record.commissionableLitres, 0)
+  const eligibleCommissionLitresForRange = products.reduce((sum, product) => sum + fuelSales.filter((sale) => sale.date >= reportRange.from && sale.date <= reportRange.to && sale.product === product).reduce((productSum, sale) => productSum + sale.litres, 0), 0)
+  const commissionDatePreview = remainingEligibleLitresFor(commissionPreviewDate, commissionPreviewProduct)
+  const filteredSales = fuelSales.filter((sale) => sale.date >= reportRange.from && sale.date <= reportRange.to)
+  const filteredMeters = meters.filter((meter) => meter.date >= reportRange.from && meter.date <= reportRange.to)
   const filteredPurchases = purchases.filter((purchase) => purchase.date >= reportRange.from && purchase.date <= reportRange.to)
-  const filteredExpenses = expenses.filter((expense) => expense.date >= reportRange.from && expense.date <= reportRange.to)
+  const filteredExpenses = expenses.filter((expense) => expense.date >= reportRange.from && expense.date <= reportRange.to && expense.category !== 'Commission')
   const filteredUdhar = udhar.filter((entry) => entry.date >= reportRange.from && entry.date <= reportRange.to)
   const visiblePurchases = purchases.filter((entry) => `${entry.date} ${entry.product} ${entry.supplier}`.toLowerCase().includes(recordSearch.toLowerCase()))
-  const visibleSales = sales.filter((sale) => `${sale.date} ${sale.product} ${sale.mode} ${sale.customer}`.toLowerCase().includes(recordSearch.toLowerCase()))
+  const visibleSales = fuelSales.filter((sale) => `${sale.date} ${sale.product} ${sale.mode} ${sale.customer}`.toLowerCase().includes(recordSearch.toLowerCase()))
   const visibleExpenses = expenses.filter((expense) => `${expense.date} ${expense.category} ${expense.description} ${expense.paidBy}`.toLowerCase().includes(recordSearch.toLowerCase()))
   const exportCsv = (filename: string, headers: string[], rows: (string | number)[][]) => {
     const escape = (value: string | number) => `"${String(value).replaceAll('"', '""')}"`
@@ -381,17 +590,48 @@ export default function App() {
     flash(`${filename} downloaded.`)
   }
 
-  const dashboardRange = useMemo(() => resolveDateRange(dashboardPeriod, dashboardCustomFrom, dashboardCustomTo), [dashboardCustomFrom, dashboardCustomTo, dashboardPeriod])
+  const dashboardRange = useMemo(() => resolveDateRange(dashboardPeriod, dashboardCustomFrom, dashboardCustomTo, currentSystemDate), [currentSystemDate, dashboardCustomFrom, dashboardCustomTo, dashboardPeriod])
   const dashboardSummary = useMemo(
-    () => getDashboardSummary({ startDate: dashboardRange.from, endDate: dashboardRange.to, sales, expenses, udhar }),
-    [dashboardRange, expenses, sales, udhar],
+    () => getDashboardSummary({ startDate: dashboardRange.from, endDate: dashboardRange.to, sales: fuelSales, expenses, udhar, commission: commissionRecords }),
+    [commissionRecords, dashboardRange, expenses, fuelSales, udhar],
   )
+  const dailySales = fuelSales.filter((sale) => sale.date === currentSystemDate)
+  const dailyExpenses = expenses.filter((expense) => expense.date === currentSystemDate && expense.category !== 'Commission')
+  const dailyCommission = getCommissionTotal({ startDate: currentSystemDate, endDate: currentSystemDate, records: commissionRecords })
+
+  const safetySummaryRange = useMemo(() => {
+    if (safetySummaryPeriod === 'Today') return { from: currentSystemDate, to: currentSystemDate }
+    if (safetySummaryPeriod === 'This Week') return resolveDateRange('This Week', '', '', currentSystemDate)
+    if (safetySummaryPeriod === 'Previous Week') {
+      const thisWeek = resolveDateRange('This Week', '', '', currentSystemDate)
+      const previousWeekEnd = new Date(`${thisWeek.from}T00:00:00`)
+      previousWeekEnd.setDate(previousWeekEnd.getDate() - 1)
+      const previousWeekDate = `${previousWeekEnd.getFullYear()}-${String(previousWeekEnd.getMonth() + 1).padStart(2, '0')}-${String(previousWeekEnd.getDate()).padStart(2, '0')}`
+      return resolveDateRange('This Week', '', '', previousWeekDate)
+    }
+    return { from: safetySummaryFrom || currentSystemDate, to: safetySummaryTo || currentSystemDate }
+  }, [currentSystemDate, safetySummaryFrom, safetySummaryPeriod, safetySummaryTo])
+  const safetySummaryRecords = selectedSafetyProduct ? meters.filter((meter) => meter.product === selectedSafetyProduct && meter.date >= safetySummaryRange.from && meter.date <= safetySummaryRange.to) : []
+  const safetyDailyRows = Array.from(new Set(safetySummaryRecords.map((meter) => meter.date))).sort((a, b) => b.localeCompare(a)).map((date) => {
+    const records = safetySummaryRecords.filter((meter) => meter.date === date)
+    return { date, opening: Math.min(...records.map((meter) => meter.previous)), closing: Math.max(...records.map((meter) => meter.present)), litres: records.reduce((sum, meter) => sum + meter.litres, 0), entries: records.length }
+  })
+  const safetyWeeklyRows = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'].map((day, index) => {
+    const records = safetySummaryRecords.filter((meter) => {
+      const date = new Date(`${meter.date}T00:00:00`)
+      const dayIndex = date.getDay() === 0 ? 6 : date.getDay() - 1
+      return dayIndex === index
+    })
+    return { day, litres: records.reduce((sum, meter) => sum + meter.litres, 0), entries: records.length }
+  })
+  const safetyTotalLitres = safetySummaryRecords.reduce((sum, meter) => sum + meter.litres, 0)
+  const safetyAverageDaily = safetyDailyRows.length ? safetyTotalLitres / safetyDailyRows.length : 0
 
   const fuelStockRows = useMemo(() => {
     return products.map((product) => {
       const opening = stockOpenings[product] || 0
       const purchased = purchases.filter((entry) => entry.product === product).reduce((sum, entry) => sum + entry.litres, 0)
-      const sold = sales.filter((entry) => entry.product === product).reduce((sum, entry) => sum + entry.litres, 0)
+      const sold = fuelSales.filter((entry) => entry.product === product).reduce((sum, entry) => sum + entry.litres, 0)
       const adjustment = stockAdjustments.filter((entry) => entry.product === product).reduce((sum, entry) => sum + entry.quantity, 0)
       const result = calculateFuelStockSummary({ product, opening, purchased, sold, adjustment })
       return {
@@ -403,21 +643,89 @@ export default function App() {
         remaining: result.remaining,
       }
     })
-  }, [purchases, sales, stockAdjustments, stockOpenings])
+  }, [fuelSales, purchases, stockAdjustments, stockOpenings])
 
   const statementEntries = udhar.filter((item) => item.customerId === statementCustomerId && item.date <= statementDate).sort((a, b) => a.date.localeCompare(b.date) || a.id - b.id)
   const statementBalance = statementEntries.reduce((balance, item) => balance + item.debit - item.credit, 0)
+  const activeBankAccounts = bankAccounts.filter((account) => account.active !== false)
+  const bankAccountLabel = (account: BankAccount) => `${account.bankName} - ${account.accountName}`
+  const brsBankName = (entry: BRSRecord) => {
+    const account = bankAccounts.find((item) => item.id === entry.bankAccountId)
+    return account ? bankAccountLabel(account) : entry.legacyBankName || 'Unlinked bank'
+  }
+
+  const reportOptions = [
+    ['Operations', 'Daily Sales'], ['Operations', 'Fuel Sales'], ['Operations', 'Meter Reading'], ['Operations', 'Fuel Stock'], ['Operations', 'Fuel Purchase'], ['Operations', 'Mobile Oil'],
+    ['Financial', 'Expenses'], ['Financial', 'Profit & Loss'], ['Financial', 'Customer / Udhar'], ['Financial', 'Bank / BRS'], ['Financial', 'Daily Closing'],
+    ['Summary', 'Monthly Summary'], ['Summary', 'Yearly Summary'],
+  ]
+  const reportFuelRows = products.map((product) => {
+    const rows = filteredSales.filter((sale) => sale.product === product)
+    return [product, `${rows.reduce((sum, sale) => sum + sale.litres, 0).toLocaleString()} L`, rows.length ? printMoney(rows.reduce((sum, sale) => sum + sale.amount, 0) / rows.length / (rows.reduce((sum, sale) => sum + sale.litres, 0) / rows.length || 1)) : printMoney(0), printMoney(rows.reduce((sum, sale) => sum + sale.amount, 0)), rows.length]
+  })
+  const monthlySummaryRows = Array.from(new Set([...filteredSales.map((sale) => sale.date.slice(0, 7)), ...filteredPurchases.map((purchase) => purchase.date.slice(0, 7)), ...filteredExpenses.map((expense) => expense.date.slice(0, 7)), ...commissionRangeRecords.map((record) => record.date.slice(0, 7))])).sort().map((month) => {
+    const salesTotal = filteredSales.filter((sale) => sale.date.startsWith(month)).reduce((sum, sale) => sum + sale.amount, 0)
+    const litresTotal = filteredSales.filter((sale) => sale.date.startsWith(month)).reduce((sum, sale) => sum + sale.litres, 0)
+    const purchasesTotal = filteredPurchases.filter((purchase) => purchase.date.startsWith(month)).reduce((sum, purchase) => sum + purchase.amount, 0)
+    const expensesTotal = filteredExpenses.filter((expense) => expense.date.startsWith(month)).reduce((sum, expense) => sum + expense.amount, 0)
+    const commissionTotal = commissionRangeRecords.filter((record) => record.date.startsWith(month)).reduce((sum, record) => sum + record.amount, 0)
+    return [month, printMoney(salesTotal), `${litresTotal.toLocaleString()} L`, printMoney(purchasesTotal), printMoney(expensesTotal), printMoney(commissionTotal), printMoney(salesTotal - purchasesTotal - expensesTotal - commissionTotal)]
+  })
+  const reportData = (() => {
+    const reportPeriodLabel = `${displayDate(reportRange.from)} - ${displayDate(reportRange.to)}`
+    const totalSales = filteredSales.reduce((sum, sale) => sum + sale.amount, 0)
+    const totalLitres = filteredSales.reduce((sum, sale) => sum + sale.litres, 0)
+    const totalExpenses = filteredExpenses.reduce((sum, expense) => sum + expense.amount, 0)
+    const totalCommission = commissionAmountForRange
+    const operatingExpenses = totalExpenses + totalCommission
+    if (selectedReport === 'Fuel Sales') return { title: 'Fuel Sales Report', description: 'Fuel performance by product for the selected period.', headers: ['Fuel Type', 'Total Litres', 'Average Rate', 'Total Sales', 'Transactions'], rows: reportFuelRows, summary: [['Total Sales', printMoney(totalSales)], ['Total Litres', `${totalLitres.toLocaleString()} L`]] as [string, string][] }
+    if (selectedReport === 'Meter Reading') return { title: 'Meter Reading Report', description: 'Daily nozzle meter readings for the selected period.', headers: ['Date', 'Fuel', 'Nozzle', 'Opening', 'Closing', 'Litres', 'Rate', 'Amount'], rows: filteredMeters.map((meter) => [meter.date, meter.product, meter.nozzle, meter.previous, meter.present, meter.litres, meter.rate === undefined ? '-' : printMoney(meter.rate), meter.amount === undefined ? '-' : printMoney(meter.amount)]), summary: [['Total Litres', `${filteredMeters.reduce((sum, meter) => sum + meter.litres, 0).toLocaleString()} L`], ['Total Amount', printMoney(filteredMeters.reduce((sum, meter) => sum + (meter.amount || 0), 0))]] as [string, string][] }
+    if (selectedReport === 'Fuel Stock') return { title: 'Fuel Stock Report', description: 'Opening stock, movement, adjustments, and calculated closing stock.', headers: ['Fuel', 'Opening', 'Purchases', 'Sales', 'Adjustments', 'Closing Stock'], rows: fuelStockRows.map((row) => [row.product, `${row.opening.toLocaleString()} L`, `${row.purchased.toLocaleString()} L`, `${row.sold.toLocaleString()} L`, `${row.adjustment.toLocaleString()} L`, `${row.remaining.toLocaleString()} L`]) }
+    if (selectedReport === 'Fuel Purchase') return { title: 'Fuel Purchase Report', description: 'Fuel received from suppliers during the selected period.', headers: ['Date', 'Supplier', 'Fuel', 'Litres', 'Rate', 'Amount'], rows: filteredPurchases.map((purchase) => [purchase.date, purchase.supplier, purchase.product, purchase.litres, printMoney(purchase.rate), printMoney(purchase.amount)]), summary: [['Total Purchased', `${filteredPurchases.reduce((sum, purchase) => sum + purchase.litres, 0).toLocaleString()} L`], ['Total Amount', printMoney(filteredPurchases.reduce((sum, purchase) => sum + purchase.amount, 0))]] as [string, string][] }
+    if (selectedReport === 'Expenses') return { title: 'Expense Report', description: 'Operating expenses recorded during the selected period.', headers: ['Category', 'Transactions', 'Total Amount'], rows: [['Salaries', filteredExpenses.filter((expense) => expense.category === 'Salary').length, printMoney(filteredExpenses.filter((expense) => expense.category === 'Salary').reduce((sum, expense) => sum + expense.amount, 0))], ['Electricity', filteredExpenses.filter((expense) => expense.category === 'Electricity').length, printMoney(filteredExpenses.filter((expense) => expense.category === 'Electricity').reduce((sum, expense) => sum + expense.amount, 0))], ['Pump Expenses', filteredExpenses.filter((expense) => expense.category === 'Pump Expenses').length, printMoney(filteredExpenses.filter((expense) => expense.category === 'Pump Expenses').reduce((sum, expense) => sum + expense.amount, 0))], ['Commission', commissionRangeRecords.length, printMoney(totalCommission)], ['Other Expenses', filteredExpenses.filter((expense) => !['Salary', 'Electricity', 'Pump Expenses'].includes(expense.category)).length, printMoney(filteredExpenses.filter((expense) => !['Salary', 'Electricity', 'Pump Expenses'].includes(expense.category)).reduce((sum, expense) => sum + expense.amount, 0))]], summary: [['Total Operating Expenses', printMoney(operatingExpenses)]] as [string, string][] }
+    if (selectedReport === 'Profit & Loss') return { title: 'Profit & Loss Report', description: 'Revenue, cost of goods, and operating result.', headers: ['Section', 'Amount'], rows: [['Fuel Sales', printMoney(totalSales)], ['Mobile Oil Sales', printMoney(oilSales.filter((sale) => sale.date >= reportRange.from && sale.date <= reportRange.to).reduce((sum, sale) => sum + sale.amount, 0))], ['Fuel Purchases / Cost', printMoney(filteredPurchases.reduce((sum, purchase) => sum + purchase.amount, 0))], ['Gross Profit', printMoney(totalSales - filteredPurchases.reduce((sum, purchase) => sum + purchase.amount, 0))], ['Commission', printMoney(totalCommission)], ['Other Operating Expenses', printMoney(totalExpenses)], ['Net Profit / Result', printMoney(totalSales - filteredPurchases.reduce((sum, purchase) => sum + purchase.amount, 0) - operatingExpenses)]] }
+    if (selectedReport === 'Customer / Udhar') return { title: 'Customer / Udhar Report', description: 'Credit sales, collections, and outstanding balances.', headers: ['Customer', 'Credit Sales', 'Collections', 'Outstanding'], rows: customers.map((customer) => { const credit = filteredUdhar.filter((entry) => entry.customerId === customer.id && entry.type === 'Credit Sale').reduce((sum, entry) => sum + entry.debit, 0); const collections = filteredUdhar.filter((entry) => entry.customerId === customer.id && entry.type === 'Payment Received').reduce((sum, entry) => sum + entry.credit, 0); return [customer.name, printMoney(credit), printMoney(collections), printMoney(credit - collections)] }), summary: [['Credit Sales', printMoney(filteredUdhar.filter((entry) => entry.type === 'Credit Sale').reduce((sum, entry) => sum + entry.debit, 0))], ['Collections', printMoney(filteredUdhar.filter((entry) => entry.type === 'Payment Received').reduce((sum, entry) => sum + entry.credit, 0))]] as [string, string][] }
+    if (selectedReport === 'Bank / BRS') return { title: 'Bank Reconciliation Statement', description: 'Bank transactions and reconciliation differences.', headers: ['Date', 'Bank', 'Type', 'Reference', 'PPMS Amount', 'Bank Amount', 'Difference', 'Status'], rows: brsRecords.filter((entry) => entry.date >= reportRange.from && entry.date <= reportRange.to).map((entry) => [entry.date, brsBankName(entry), entry.type, entry.reference, printMoney(entry.amount), printMoney(entry.bankAmount || 0), printMoney(entry.difference ?? entry.amount - (entry.bankAmount || 0)), entry.status]) }
+    if (selectedReport === 'Mobile Oil') return { title: 'Mobile Oil Report', description: 'Mobile oil sales recorded during the selected period.', headers: ['Date', 'Item', 'Quantity', 'Rate', 'Amount'], rows: oilSales.filter((sale) => sale.date >= reportRange.from && sale.date <= reportRange.to).map((sale) => [sale.date, sale.item, sale.quantity, printMoney(sale.rate), printMoney(sale.amount)]), summary: [['Total Revenue', printMoney(oilSales.filter((sale) => sale.date >= reportRange.from && sale.date <= reportRange.to).reduce((sum, sale) => sum + sale.amount, 0))]] as [string, string][] }
+    if (selectedReport === 'Daily Closing') return { title: 'Daily Closing Report', description: 'Daily operational and financial closing summary.', headers: ['Metric', 'Value'], rows: [['Fuel Sales', printMoney(totalSales)], ['Fuel Litres', `${totalLitres.toLocaleString()} L`], ['Expenses', printMoney(totalExpenses)], ['Commission', printMoney(totalCommission)], ['Net Result', printMoney(totalSales - operatingExpenses)]] }
+    if (selectedReport === 'Monthly Summary' || selectedReport === 'Yearly Summary') return { title: selectedReport, description: 'Period performance summarized by month.', headers: ['Month', 'Sales', 'Litres', 'Purchases', 'Expenses', 'Commission', 'Net Result'], rows: monthlySummaryRows, summary: [['Total Sales', printMoney(totalSales)], ['Total Purchases', printMoney(filteredPurchases.reduce((sum, purchase) => sum + purchase.amount, 0))], ['Total Expenses', printMoney(operatingExpenses)], ['Net Result', printMoney(totalSales - filteredPurchases.reduce((sum, purchase) => sum + purchase.amount, 0) - operatingExpenses)]] as [string, string][] }
+    return { title: 'Daily Sales Report', description: 'Business sales and fuel performance for the selected period.', headers: ['Date', 'Fuel Type', 'Litres', 'Rate', 'Sales Amount', 'Payment Type'], rows: filteredSales.map((sale) => [sale.date, sale.product, sale.litres, printMoney(sale.rate), printMoney(sale.amount), sale.mode]), summary: [['Total Sales', printMoney(totalSales)], ['Total Litres', `${totalLitres.toLocaleString()} L`], ...products.map((product) => [`${product} Sales`, printMoney(filteredSales.filter((sale) => sale.product === product).reduce((sum, sale) => sum + sale.amount, 0))]), ['Cash Sales', printMoney(filteredSales.filter((sale) => sale.mode === 'Cash').reduce((sum, sale) => sum + sale.amount, 0))], ['Credit / Udhar Sales', printMoney(filteredSales.filter((sale) => sale.mode === 'Credit').reduce((sum, sale) => sum + sale.amount, 0))]] as [string, string][] }
+  })()
+
+  const printableReport = (() => {
+    const period = selectedTab === 'Dashboard' ? `${displayDate(dashboardRange.from)} - ${displayDate(dashboardRange.to)}` : `${displayDate(reportRange.from)} - ${displayDate(reportRange.to)}`
+    if (selectedTab === 'Reports') return { title: reportData.title, period, headers: reportData.headers, rows: reportData.rows, summary: reportData.summary }
+    if (printRequest?.title === 'Bank Reconciliation Statement') return { title: printRequest.title, period, headers: ['Date', 'Bank Account', 'Type', 'Reference', 'Description', 'PPMS Amount', 'Bank Amount', 'Difference', 'Status'], rows: brsRecords.map((entry) => [entry.date, brsBankName(entry), entry.type, entry.reference, entry.description, printMoney(entry.amount), printMoney(entry.bankAmount || 0), printMoney(entry.difference ?? entry.amount - (entry.bankAmount || 0)), entry.status]), summary: [['Total PPMS Amount', printMoney(brsRecords.reduce((sum, entry) => sum + entry.amount, 0))], ['Total Bank Amount', printMoney(brsRecords.reduce((sum, entry) => sum + (entry.bankAmount || 0), 0))], ['Total Difference', printMoney(brsRecords.reduce((sum, entry) => sum + (entry.difference ?? entry.amount - (entry.bankAmount || 0)), 0))]] as [string, string][] }
+    if (selectedTab === 'Meter Reading') return { title: 'Daily Meter Reading Register', period, headers: ['Date', 'Nozzle', 'Fuel', 'Opening', 'Closing', 'Litres Sold', 'Rate', 'Amount'], rows: filteredMeters.map((meter) => [meter.date, meter.nozzle, meter.product, meter.previous, meter.present, meter.litres, meter.rate === undefined ? '-' : printMoney(meter.rate), meter.amount === undefined ? '-' : printMoney(meter.amount)]), summary: [['Total Litres Sold', `${filteredMeters.reduce((sum, meter) => sum + meter.litres, 0).toLocaleString()} L`], ['Total Amount', printMoney(filteredMeters.reduce((sum, meter) => sum + (meter.amount || 0), 0))]] as [string, string][] }
+    if (selectedTab === 'Fuel Management') return { title: 'Fuel Purchase & Stock Report', period, headers: ['Fuel', 'Opening', 'Purchases', 'Sales', 'Adjustments', 'Closing Stock'], rows: fuelStockRows.map((row) => [row.product, row.opening, row.purchased, row.sold, row.adjustment, row.remaining]) }
+    if (selectedTab === 'Sales') return { title: 'Fuel Sales Report', period, headers: ['Date', 'Fuel', 'Litres', 'Rate', 'Amount', 'Payment Type', 'Customer'], rows: filteredSales.map((sale) => [sale.date, sale.product, sale.litres, printMoney(sale.rate), printMoney(sale.amount), sale.mode, sale.customer]), summary: [['Total Sales', printMoney(filteredSales.reduce((sum, sale) => sum + sale.amount, 0))], ['Total Litres', `${filteredSales.reduce((sum, sale) => sum + sale.litres, 0).toLocaleString()} L`]] as [string, string][] }
+    if (selectedTab === 'Expenses') return { title: 'Daily Expense Report', period, headers: ['Date', 'Category', 'Description', 'Amount', 'Paid By'], rows: filteredExpenses.map((expense) => [expense.date, expense.category, expense.description, printMoney(expense.amount), expense.paidBy]), summary: [['Total Expenses', printMoney(filteredExpenses.reduce((sum, expense) => sum + expense.amount, 0))]] as [string, string][] }
+    if (selectedTab === 'Mobile Oil') return { title: 'Mobile Oil Sales Report', period, headers: ['Date', 'Item', 'Quantity', 'Rate', 'Amount'], rows: oilSales.filter((sale) => sale.date >= reportRange.from && sale.date <= reportRange.to).map((sale) => [sale.date, sale.item, sale.quantity, printMoney(sale.rate), printMoney(sale.amount)]) }
+    if (selectedTab === 'Commission') return { title: 'Commission Report', period, headers: ['Date', 'Fuel', 'Eligible Litres', 'Commissionable Litres', 'Rate / Litre', 'Commission'], rows: commissionRangeRecords.map((record) => [record.date, record.product, `${record.eligibleLitres.toLocaleString()} L`, `${record.commissionableLitres.toLocaleString()} L`, printMoney(record.rate), printMoney(record.amount)]), summary: [['Total Eligible Litres', `${eligibleCommissionLitresForRange.toLocaleString()} L`], ['Total Commissionable Litres', `${commissionLitresForRange.toLocaleString()} L`], ['Remaining Eligible Litres', `${Math.max(0, eligibleCommissionLitresForRange - commissionLitresForRange).toLocaleString()} L`], ['Total Commission', printMoney(commissionAmountForRange)]] as [string, string][] }
+    if (selectedTab === 'Safety Duty') return { title: 'Safety Duty Register', period, headers: ['Nozzle', 'Fuel', 'Opening', 'Closing', 'Total Litres'], rows: meters.map((meter) => [meter.nozzle, meter.product, meter.previous, meter.present, meter.litres]) }
+    if (selectedTab === 'Customers') return { title: 'Customer Ledger / Customer Statement', period: displayDate(statementDate), headers: ['Date', 'Type', 'Reference', 'Debit', 'Credit', 'Description'], rows: statementEntries.map((entry) => [entry.date, entry.type, entry.reference, printMoney(entry.debit), printMoney(entry.credit), entry.description]), summary: [['Closing Balance', printMoney(statementBalance)]] as [string, string][] }
+    if (selectedTab === 'Reports' || selectedTab === 'Accounting') return { title: selectedTab === 'Accounting' ? 'Accounting / Cash Book Report' : 'Monthly Financial & Operations Report', period, headers: ['Ledger', 'Total', 'Notes'], rows: [['Fuel Sales', printMoney(filteredSales.reduce((sum, sale) => sum + sale.amount, 0)), 'Gross fuel revenue'], ['Fuel Purchases', printMoney(filteredPurchases.reduce((sum, purchase) => sum + purchase.amount, 0)), 'Stock procurement'], ['Expenses', printMoney(filteredExpenses.reduce((sum, expense) => sum + expense.amount, 0)), 'Operating costs'], ['Commission', printMoney(commissionAmountForRange), 'Recorded commission expense']] }
+    if (selectedTab === 'Daily Operations') return { title: 'Daily Closing Report', period: displayDate(currentSystemDate), headers: ['Metric', 'Value'], rows: [['Fuel Sales', printMoney(dailySales.reduce((sum, sale) => sum + sale.amount, 0))], ['Fuel Litres', `${dailySales.reduce((sum, sale) => sum + sale.litres, 0).toLocaleString()} L`], ['Expenses', printMoney(dailyExpenses.reduce((sum, expense) => sum + expense.amount, 0))], ['Commission', printMoney(dailyCommission)], ['Net Result', printMoney(dailySales.reduce((sum, sale) => sum + sale.amount, 0) - dailyExpenses.reduce((sum, expense) => sum + expense.amount, 0) - dailyCommission)]] }
+    return { title: 'Daily Dashboard Summary', period, headers: ['Metric', 'Value'], rows: [['Fuel Sales', printMoney(dashboardSummary.totalSales)], ['Fuel Litres Sold', `${dashboardSummary.totalFuelLitres.toLocaleString()} L`], ...products.map((product) => [product, printMoney(fuelSales.filter((sale) => sale.product === product && sale.date >= dashboardRange.from && sale.date <= dashboardRange.to).reduce((sum, sale) => sum + sale.amount, 0))]), ['Expenses', printMoney(dashboardSummary.operatingExpenses)], ['Sales Less Expenses', printMoney(dashboardSummary.netSales)]] }
+  })()
 
   const saveMeter = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const data = new FormData(event.currentTarget)
     const previous = numberValue(data.get('previous'))
     const present = numberValue(data.get('present'))
+    const rate = numberValue(data.get('rate'))
     const product = String(data.get('product')) as Product
     const nozzle = String(data.get('nozzle'))
+    const date = String(data.get('date'))
+    const shift = String(data.get('shift'))
+    if (previous < 0) return flash('Opening meter reading cannot be negative.')
+    if (rate < 0) return flash('Rate cannot be negative.')
     if (present < previous) return flash('Present reading cannot be less than previous reading.')
     if (!productNozzles[product].includes(nozzle)) return flash(`${nozzle} does not belong to ${product}.`)
-    const entry: MeterReading = { id: Date.now(), date: String(data.get('date')), shift: String(data.get('shift')), nozzle, product, previous, present, litres: present - previous }
+    if (meters.some((meter) => meter.date === date && meter.shift === shift && meter.nozzle === nozzle)) return flash(`A reading already exists for ${nozzle} on this date and shift.`)
+    const litres = present - previous
+    const entry: MeterReading = { id: Date.now(), date, shift, nozzle, product, previous, present, litres, rate, amount: litres * rate }
     setMeters((current) => [entry, ...current])
     event.currentTarget.reset()
     flash('Meter reading saved.')
@@ -549,6 +857,24 @@ export default function App() {
     flash('Mobile oil sale saved.')
   }
 
+  const saveCommission = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    const data = new FormData(event.currentTarget)
+    const date = String(data.get('date') || '')
+    const product = String(data.get('product')) as Product
+    const commissionableLitres = Number(data.get('commissionableLitres'))
+    const rate = Number(data.get('rate'))
+    const eligibleLitres = eligibleLitresFor(date, product)
+    const remainingLitres = remainingEligibleLitresFor(date, product)
+    if (!date || !products.includes(product)) return flash('Date and fuel type are required.')
+    if (!Number.isFinite(commissionableLitres) || commissionableLitres < 0 || !Number.isFinite(rate) || rate < 0) return flash('Commissionable litres and rate must be valid non-negative numbers.')
+    if (commissionableLitres > remainingLitres) return flash(`Commissionable litres cannot exceed remaining eligible litres (${remainingLitres.toLocaleString()} L).`)
+    const record: CommissionRecord = { id: Date.now(), date, product, eligibleLitres, commissionableLitres, rate, amount: calculateCommissionAmount(commissionableLitres, rate), reference: String(data.get('reference') || ''), notes: String(data.get('notes') || '') }
+    setCommissionRecords((current) => [record, ...current])
+    event.currentTarget.reset()
+    flash('Commission entry saved.')
+  }
+
   const saveDiscountRule = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const data = new FormData(event.currentTarget)
@@ -626,23 +952,51 @@ export default function App() {
     flash('Family adjustment saved.')
   }
 
+  const saveBankAccount = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    const data = new FormData(event.currentTarget)
+    const bankName = String(data.get('bankName') || '').trim()
+    const accountName = String(data.get('accountName') || '').trim()
+    const accountNumber = String(data.get('accountNumber') || '').trim()
+    if (!bankName || !accountName || !accountNumber) return flash('Bank name, account name, and account number are required.')
+    if (bankAccounts.some((account) => account.accountNumber === accountNumber)) return flash('That bank account number already exists.')
+    const account: BankAccount = { id: Date.now(), bankName, accountName, accountNumber, openingBalance: numberValue(data.get('openingBalance')), currentBookBalance: numberValue(data.get('currentBookBalance')), active: true }
+    setBankAccounts((current) => [account, ...current])
+    event.currentTarget.reset()
+    flash('Bank account created.')
+  }
+
   const saveBRSRecord = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const data = new FormData(event.currentTarget)
+    const bankAccountId = Number(data.get('bankAccountId'))
+    const bankAccount = bankAccounts.find((account) => account.id === bankAccountId && account.active !== false)
+    const date = String(data.get('date') || '')
+    const type = String(data.get('type')) as BRSRecord['type']
+    const amount = Number(data.get('amount'))
+    const bankAmount = Number(data.get('bankAmount'))
+    if (!bankAccount) return flash('Select a valid active bank account.')
+    if (!date) return flash('Transaction date is required.')
+    if (!['Deposit', 'Withdrawal'].includes(type)) return flash('Select a transaction type.')
+    if (!Number.isFinite(amount) || amount < 0 || !Number.isFinite(bankAmount) || bankAmount < 0) return flash('PPMS and bank amounts must be valid non-negative numbers.')
+    const difference = amount - bankAmount
     const record: BRSRecord = {
       id: Date.now(),
-      bankAccountId: Number(data.get('bankAccountId')),
-      date: String(data.get('date')),
+      bankAccountId,
+      date,
       description: String(data.get('description')),
-      type: String(data.get('type')) as BRSRecord['type'],
-      amount: numberValue(data.get('amount')),
-      bankAmount: numberValue(data.get('bankAmount')),
+      type,
+      amount,
+      bankAmount,
       adjustment: numberValue(data.get('adjustment')),
       status: String(data.get('status')) as BRSRecord['status'],
       reference: String(data.get('reference')),
+      difference,
     }
     setBrsRecords((current) => [record, ...current])
     event.currentTarget.reset()
+    setBrsBookAmount('0')
+    setBrsBankAmount('0')
     flash('BRS transaction saved.')
   }
 
@@ -689,12 +1043,14 @@ export default function App() {
         {[
           ['Fuel Sales', money(dashboardSummary.totalSales)],
           ['Fuel Litres Sold', `${dashboardSummary.totalFuelLitres.toLocaleString()} L`],
-          ['HSD Sales', money(sales.filter((sale) => sale.product === 'HSD' && sale.date >= dashboardRange.from && sale.date <= dashboardRange.to).reduce((sum, sale) => sum + sale.amount, 0))],
-          ['PMG Sales', money(sales.filter((sale) => sale.product === 'PMG' && sale.date >= dashboardRange.from && sale.date <= dashboardRange.to).reduce((sum, sale) => sum + sale.amount, 0))],
-          ['Expenses', money(dashboardSummary.totalExpenses)],
+          ...products.flatMap((product) => {
+            const periodSales = fuelSales.filter((sale) => sale.product === product && sale.date >= dashboardRange.from && sale.date <= dashboardRange.to)
+            return [[`${product} Litres Sold`, `${periodSales.reduce((sum, sale) => sum + sale.litres, 0).toLocaleString()} L`], [`${product} Sales`, money(periodSales.reduce((sum, sale) => sum + sale.amount, 0))]]
+          }),
+          ['Expenses', money(dashboardSummary.operatingExpenses)],
           ['Credit / Udhar Sales', money(dashboardSummary.creditSales)],
           ['Customer Payments', money(dashboardSummary.customerPayments)],
-          ['Net Sales', money(dashboardSummary.netSales)],
+          ['Sales Less Expenses', money(dashboardSummary.netSales)],
           ['Current Receivables', money(customers.reduce((sum, customer) => sum + customerBalance(customer.id, customers, udhar), 0))],
         ].map(([label, value]) => <div key={label} className="metric-card"><span>{label}</span><strong>{value}</strong></div>)}
       </section>
@@ -741,23 +1097,54 @@ export default function App() {
 
   const settingsPage = (
     <>
+      {authUser?.role === 'admin' && <section className="register-section"><div className="section-heading"><h3>Account Security</h3><span className="form-note">Change your login password.</span></div><div className="form-actions"><button className="primary-button" type="button" onClick={() => { setShowChangePassword(true); setChangePasswordError(''); setChangePasswordSuccess(false) }}>Change Password</button></div></section>}
       {authUser?.role === 'admin' && <><FormPanel title="User and Role Management" onSubmit={saveUser} submitLabel="Create User"><Field label="Username" name="username" /><Field label="Temporary Password" name="password" type="password" /><Field label="Role" name="role" options={['admin', 'manager', 'operator']} defaultValue="operator" /></FormPanel><section className="register-section"><div className="section-heading"><h3>Users</h3><button className="ghost-button" type="button" onClick={loadUsers}>Refresh Users</button></div><DataTable headers={['Username', 'Role', 'Status']} rows={users.map((user) => [user.username, user.role, 'Active'])} /></section><section className="register-section role-guide"><div className="section-heading"><h3>Role Permissions</h3></div><div className="role-guide-grid"><div><strong>Admin</strong><p>Full access, including user creation and accounting settings.</p></div><div><strong>Manager</strong><p>Runs operational registers and can update station data, but cannot manage user accounts.</p></div><div><strong>Operator</strong><p>Records daily operations. Settings are hidden, and accounting settings cannot be changed.</p></div></div></section></>}
       <section className="register-section">
-        <div className="section-heading"><h3>Data Backup and Restore</h3><span className="form-note">Versioned local register data</span></div>
-        <div className="form-actions"><button className="primary-button" type="button" onClick={downloadBackup}>Download Backup</button><label className="ghost-button file-button">Restore Backup<input type="file" accept="application/json,.json" onChange={(event) => { const file = event.target.files?.[0]; if (file) uploadBackup(file) }} /></label>{authUser?.role === 'admin' && <button className="danger-button" type="button" onClick={resetRegisterData}>Reset Register Data</button>}</div>
-        <p className="form-note">Reset Register Data removes operational records and keeps user accounts.</p>
+        <div className="section-heading"><h3>Offline Database and Backup</h3><span className="form-note">Local SQLite data</span></div>
+        <div className="summary-strip"><strong>Database: {systemStatus?.databaseExists ? 'Connected' : 'Unavailable'}</strong><strong>Version: {systemStatus?.version || 'Loading'}</strong><strong>Backups: {backups.length}</strong></div>
+        <p className="form-note">Database location: {systemStatus?.databasePath || 'Loading'}<br />Backup folder: {systemStatus?.backupDir || 'Loading'}</p>
+        <div className="form-actions"><button className="primary-button" type="button" onClick={backupDatabase}>Backup Database Now</button><button className="ghost-button" type="button" onClick={downloadBackup}>Download Register Backup</button>{authUser?.role === 'admin' && <button className="danger-button" type="button" onClick={resetRegisterData}>Reset Register Data</button>}</div>
+        <div className="table-wrap"><table><thead><tr><th>Backup</th><th>Modified</th><th>Size</th><th>Action</th></tr></thead><tbody>{backups.length ? backups.map((backup) => <tr key={backup.name}><td>{backup.name}</td><td>{new Date(backup.modifiedAt).toLocaleString()}</td><td>{Math.ceil(backup.size / 1024)} KB</td><td><button className="table-action" type="button" onClick={() => restoreDatabase(backup.name)}>Restore</button></td></tr>) : <tr><td colSpan={4} className="empty-cell">No database backups found.</td></tr>}</tbody></table></div>
+        <p className="form-note">Automatic daily backups run for administrators. Restoring always creates a safety backup first.</p>
       </section>
       <FormPanel title="Payment Fee Configuration" onSubmit={savePaymentFee} submitLabel="Save Fee Policy"><Field label="Payment Method" name="method" options={['Cash', 'Card', 'Credit Card', 'Debit Card', 'Bank Transfer', 'Online Payment', 'Other']} defaultValue="Card" /><Field label="Fee Percentage" name="feePercent" type="number" defaultValue={2} /><Field label="Effective Date" name="effectiveDate" type="date" defaultValue={today} /><Field label="Status" name="status" options={['Active', 'Inactive']} defaultValue="Active" /><Field label="Absorbed by Business" name="absorbedByBusiness" options={['true', 'false']} defaultValue="true" /></FormPanel>
       <section className="register-section"><div className="section-heading"><h3>Payment Fee Policies</h3></div><DataTable headers={['Method', 'Percent', 'Effective', 'Status', 'Business Absorbs']} rows={paymentFees.map((setting) => [setting.method, `${setting.feePercent}%`, setting.effectiveDate, setting.status, setting.absorbedByBusiness ? 'Yes' : 'No'])} /></section>
-      <FormPanel title="BRS Transaction / Reconciliation Entry" onSubmit={saveBRSRecord} submitLabel="Save BRS Record"><Field label="Bank Account" name="bankAccountId" options={bankAccounts.map((account) => `${account.id} - ${account.bankName} ${account.accountName}`)} defaultValue={`${bankAccounts[0]?.id || 1} - ${bankAccounts[0]?.bankName || ''} ${bankAccounts[0]?.accountName || ''}`} /><Field label="Date" name="date" type="date" defaultValue={today} /><Field label="Description" name="description" defaultValue="Bank transaction" /><Field label="Type" name="type" options={['Deposit', 'Withdrawal']} defaultValue="Deposit" /><Field label="Book Amount" name="amount" type="number" defaultValue={0} /><Field label="Bank Amount" name="bankAmount" type="number" defaultValue={0} /><Field label="Adjustment" name="adjustment" type="number" defaultValue={0} required={false} /><Field label="Status" name="status" options={['Matched', 'Unmatched', 'Pending', 'Book Only', 'Bank Only']} defaultValue="Pending" /><Field label="Reference" name="reference" defaultValue="BRS-001" /></FormPanel>
-      <section className="register-section"><div className="section-heading"><h3>BRS / Bank Reconciliation</h3></div><DataTable headers={['Bank', 'Account', 'Opening', 'Book Balance']} rows={bankAccounts.map((account) => [account.bankName, account.accountName, money(account.openingBalance), money(account.currentBookBalance)])} /><DataTable headers={['Date', 'Description', 'Type', 'Book', 'Bank', 'Adjustment', 'Status']} rows={brsRecords.map((entry) => [entry.date, entry.description, entry.type, money(entry.amount), money(entry.bankAmount || 0), money(entry.adjustment || 0), entry.status])} /><div className="summary-strip"><strong>Book Transactions: {brsRecords.length}</strong><strong>Reconciled: {brsRecords.filter((entry) => entry.status === 'Matched').length}</strong><strong>Difference: {money(brsRecords.reduce((sum, entry) => sum + entry.amount - (entry.bankAmount || 0) + (entry.adjustment || 0), 0))}</strong></div></section>
+      <FormPanel title="Bank Accounts" onSubmit={saveBankAccount} submitLabel="Create Bank Account"><Field label="Bank Name" name="bankName" defaultValue="" /><Field label="Account Name" name="accountName" defaultValue="" /><Field label="Account Number" name="accountNumber" defaultValue="" /><Field label="Opening Balance" name="openingBalance" type="number" defaultValue={0} /><Field label="Current Book Balance" name="currentBookBalance" type="number" defaultValue={0} /></FormPanel>
+      <section id="bank-accounts" className="register-section"><div className="section-heading"><h3>Bank Accounts</h3></div><DataTable headers={['Bank', 'Account', 'Account Number', 'Opening', 'Book Balance', 'Status']} rows={bankAccounts.map((account) => [account.bankName, account.accountName, account.accountNumber, money(account.openingBalance), money(account.currentBookBalance), account.active === false ? 'Inactive' : 'Active'])} /></section>
+      <form className="register-section entry-form" onSubmit={saveBRSRecord} onReset={() => { setBrsBookAmount('0'); setBrsBankAmount('0') }}>
+        <div className="section-heading"><h3>BRS Transaction / Reconciliation Entry</h3><span className="form-note">Bank Account is required</span></div>
+        <div className="form-grid">
+          <label className="form-field"><span>Bank Account</span><select name="bankAccountId" required disabled={!activeBankAccounts.length}><option value="">{activeBankAccounts.length ? 'Select Bank Account' : 'No bank accounts available'}</option>{activeBankAccounts.map((account) => <option key={account.id} value={account.id}>{bankAccountLabel(account)} - {account.accountNumber}</option>)}</select></label>
+          <label className="form-field"><span>Transaction Date</span><input name="date" type="date" defaultValue={today} required /></label>
+          <label className="form-field"><span>Transaction Type</span><select name="type" defaultValue="Deposit" required><option value="Deposit">Deposit</option><option value="Withdrawal">Withdrawal</option></select></label>
+          <label className="form-field"><span>Reference / Cheque No.</span><input name="reference" defaultValue="BRS-001" required /></label>
+          <label className="form-field"><span>Description</span><input name="description" defaultValue="Bank transaction" required /></label>
+          <label className="form-field"><span>PPMS Amount</span><input name="amount" type="number" min="0" value={brsBookAmount} onChange={(event) => setBrsBookAmount(event.target.value)} required /></label>
+          <label className="form-field"><span>Bank Statement Amount</span><input name="bankAmount" type="number" min="0" value={brsBankAmount} onChange={(event) => setBrsBankAmount(event.target.value)} required /></label>
+          <label className="form-field"><span>Difference</span><input value={money((Number(brsBookAmount) || 0) - (Number(brsBankAmount) || 0))} readOnly /></label>
+          <label className="form-field"><span>Adjustment</span><input name="adjustment" type="number" defaultValue={0} /></label>
+          <label className="form-field"><span>Reconciliation Status</span><select name="status" defaultValue="Pending" required><option>Matched</option><option>Unmatched</option><option>Pending</option><option>Book Only</option><option>Bank Only</option></select></label>
+        </div>
+        {!activeBankAccounts.length && <p className="form-error">No bank accounts available. Create a bank account above before recording a BRS transaction.</p>}
+        <div className="form-actions"><button className="primary-button" type="submit" disabled={!activeBankAccounts.length}>Save BRS Record</button><button className="ghost-button" type="reset">Clear</button></div>
+      </form>
+      <section className="register-section"><div className="section-heading"><h3>BRS / Bank Reconciliation</h3><button className="ghost-button" type="button" onClick={() => printDocument('Bank Reconciliation Statement', `${displayDate(reportRange.from)} - ${displayDate(reportRange.to)}`)}>Print BRS</button><label className="form-field"><span>Bank Account Filter</span><select value={brsBankFilter} onChange={(event) => setBrsBankFilter(event.target.value)}><option value="all">All Banks</option>{activeBankAccounts.map((account) => <option key={account.id} value={account.id}>{bankAccountLabel(account)}</option>)}</select></label></div><DataTable headers={['Date', 'Bank Account', 'Type', 'Reference', 'PPMS Amount', 'Bank Amount', 'Difference', 'Status']} rows={brsRecords.filter((entry) => brsBankFilter === 'all' || String(entry.bankAccountId) === brsBankFilter).map((entry) => [entry.date, brsBankName(entry), entry.type, entry.reference, money(entry.amount), money(entry.bankAmount || 0), money(entry.difference ?? entry.amount - (entry.bankAmount || 0)), entry.status])} /><div className="summary-strip"><strong>Book Transactions: {brsRecords.length}</strong><strong>Reconciled: {brsRecords.filter((entry) => entry.status === 'Matched').length}</strong><strong>Difference: {money(brsRecords.reduce((sum, entry) => sum + (entry.difference ?? entry.amount - (entry.bankAmount || 0)), 0))}</strong></div></section>
+    </>
+  )
+
+  const reportCenterPage = (
+    <>
+      <section className="report-center-heading"><div><p className="eyebrow">Business reports, operational analysis and financial summaries</p><h3>Reports</h3><p className="form-note">Report Period: {displayDate(reportRange.from)} - {displayDate(reportRange.to)}</p></div><div className="form-actions"><button className="primary-button" type="button" onClick={() => printDocument(reportData.title, `${displayDate(reportRange.from)} - ${displayDate(reportRange.to)}`)}>Print</button><button className="ghost-button" type="button" onClick={() => exportCsv(`ppms-${selectedReport.toLowerCase().replaceAll(' ', '-')}-${reportRange.from}-${reportRange.to}.csv`, reportData.headers, reportData.rows)}>Export</button></div></section>
+      <section className="register-section report-period-panel"><div className="period-picker">{['Today', 'Yesterday', 'This Week', 'This Month', 'Last Month', 'This Year', 'Custom'].map((period) => <button key={period} type="button" className={`period-button${reportPeriod === period ? ' active' : ''}`} onClick={() => setReportPeriod(period)}>{period}</button>)}</div>{reportPeriod === 'Custom' && <div className="period-controls"><label className="form-field"><span>From Date</span><input type="date" value={reportCustomFrom} onChange={(event) => setReportCustomFrom(event.target.value)} /></label><label className="form-field"><span>To Date</span><input type="date" value={reportCustomTo} onChange={(event) => setReportCustomTo(event.target.value)} /></label></div>}</section>
+      <div className="report-center-layout"><nav className="report-selector">{['Operations', 'Financial', 'Summary'].map((category) => <div key={category}><h4>{category}</h4>{reportOptions.filter((option) => option[0] === category).map(([, report]) => <button key={report} type="button" className={selectedReport === report ? 'selected' : ''} onClick={() => setSelectedReport(report)}>{report}</button>)}</div>)}</nav><section className="register-section active-report"><div className="section-heading"><div><h3>{reportData.title}</h3><p className="form-note">{reportData.description}</p></div></div><DataTable headers={reportData.headers} rows={reportData.rows} /><div className="summary-strip">{reportData.summary?.map(([label, value]) => <strong key={label}>{label}: {value}</strong>)}</div></section></div>
     </>
   )
 
   const reportsPage = (
     <>
-      <section className="register-section"><div className="section-heading"><h3>Report Period</h3><span className="form-note">{reportRange.from} - {reportRange.to}</span></div><div className="period-controls"><label className="form-field"><span>Period</span><select value={reportPeriod} onChange={(event) => setReportPeriod(event.target.value)}><option>Today</option><option>This Week</option><option>This Month</option><option>This Year</option><option>Custom</option></select></label>{reportPeriod === 'Custom' && <><label className="form-field"><span>From Date</span><input type="date" value={reportCustomFrom} onChange={(event) => setReportCustomFrom(event.target.value)} /></label><label className="form-field"><span>To Date</span><input type="date" value={reportCustomTo} onChange={(event) => setReportCustomTo(event.target.value)} /></label></>}<div className="form-actions"><button className="primary-button" type="button" onClick={() => window.print()}>Print Report</button><button className="ghost-button" type="button" onClick={() => exportCsv(`ppms-report-${reportRange.from}-${reportRange.to}.csv`, ['Ledger', 'Total', 'Notes'], [['Fuel Sales', money(filteredSales.reduce((sum, sale) => sum + sale.amount, 0)), 'Fuel revenue'], ['Fuel Purchases', money(filteredPurchases.reduce((sum, purchase) => sum + purchase.amount, 0)), 'Stock procurement'], ['Customer Payments', money(filteredUdhar.filter((item) => item.type === 'Payment Received').reduce((sum, item) => sum + item.credit, 0)), 'Receipts'], ['Expenses', money(filteredExpenses.reduce((sum, expense) => sum + expense.amount, 0)), 'Operating costs']])}>Export CSV</button></div></div></section>
-      <section className="register-section"><div className="section-heading"><h3>Monthly Statement Overview</h3></div><DataTable headers={['Ledger', 'Total', 'Notes']} rows={[['Fuel Sales', money(filteredSales.reduce((sum, sale) => sum + sale.amount, 0)), 'Gross fuel revenue'], ['Fuel Purchases', money(filteredPurchases.reduce((sum, purchase) => sum + purchase.amount, 0)), 'Stock procurement'], ['Customer Payments', money(filteredUdhar.filter((item) => item.type === 'Payment Received').reduce((sum, item) => sum + item.credit, 0)), 'Receipts'], ['Expenses', money(filteredExpenses.reduce((sum, expense) => sum + expense.amount, 0)), 'Operating costs'], ['Customers Receivable', money(customers.reduce((sum, customer) => sum + customerBalance(customer.id, customers, udhar), 0)), 'Current outstanding']]} /></section>
+      <section className="register-section"><div className="section-heading"><h3>Report Period</h3><span className="form-note">{reportRange.from} - {reportRange.to}</span></div><div className="period-controls"><label className="form-field"><span>Period</span><select value={reportPeriod} onChange={(event) => setReportPeriod(event.target.value)}><option>Today</option><option>This Week</option><option>This Month</option><option>This Year</option><option>Custom</option></select></label>{reportPeriod === 'Custom' && <><label className="form-field"><span>From Date</span><input type="date" value={reportCustomFrom} onChange={(event) => setReportCustomFrom(event.target.value)} /></label><label className="form-field"><span>To Date</span><input type="date" value={reportCustomTo} onChange={(event) => setReportCustomTo(event.target.value)} /></label></>}<div className="form-actions"><button className="primary-button" type="button" onClick={() => printDocument('Monthly Financial & Operations Report', `${displayDate(reportRange.from)} - ${displayDate(reportRange.to)}`)}>Print Report</button><button className="ghost-button" type="button" onClick={() => exportCsv(`ppms-report-${reportRange.from}-${reportRange.to}.csv`, ['Ledger', 'Total', 'Notes'], [['Fuel Sales', money(filteredSales.reduce((sum, sale) => sum + sale.amount, 0)), 'Fuel revenue'], ['Fuel Purchases', money(filteredPurchases.reduce((sum, purchase) => sum + purchase.amount, 0)), 'Stock procurement'], ['Customer Payments', money(filteredUdhar.filter((item) => item.type === 'Payment Received').reduce((sum, item) => sum + item.credit, 0)), 'Receipts'], ['Expenses', money(filteredExpenses.reduce((sum, expense) => sum + expense.amount, 0)), 'Operating costs']])}>Export CSV</button></div></div></section>
+      <section className="register-section"><div className="section-heading"><h3>Monthly Statement Overview</h3></div><DataTable headers={['Ledger', 'Total', 'Notes']} rows={[['Fuel Sales', money(filteredSales.reduce((sum, sale) => sum + sale.amount, 0)), 'Gross fuel revenue'], ['Fuel Purchases', money(filteredPurchases.reduce((sum, purchase) => sum + purchase.amount, 0)), 'Stock procurement'], ['Customer Payments', money(filteredUdhar.filter((item) => item.type === 'Payment Received').reduce((sum, item) => sum + item.credit, 0)), 'Receipts'], ['Expenses', money(filteredExpenses.reduce((sum, expense) => sum + expense.amount, 0)), 'Operating costs'], ['Commission', money(commissionAmountForRange), 'Recorded commission expense'], ['Customers Receivable', money(customers.reduce((sum, customer) => sum + customerBalance(customer.id, customers, udhar), 0)), 'Current outstanding']]} /></section>
+      <section className="register-section"><div className="section-heading"><h3>Meter Reading Report</h3></div><DataTable headers={['Date', 'Shift', 'Nozzle', 'Fuel', 'Opening', 'Closing', 'Litres Sold', 'Rate', 'Amount']} rows={filteredMeters.map((meter) => [meter.date, meter.shift, meter.nozzle, meter.product, meter.previous, meter.present, meter.litres, meter.rate === undefined ? '-' : money(meter.rate), meter.amount === undefined ? '-' : money(meter.amount)])} /></section>
       <section className="register-section"><div className="section-heading"><h3>BRS Detail</h3></div><DataTable headers={['Date', 'Description', 'Type', 'Amount', 'Status']} rows={brsRecords.filter((entry) => entry.date >= reportRange.from && entry.date <= reportRange.to).map((entry) => [entry.date, entry.description, entry.type, money(entry.amount), entry.status])} /></section>
       <FormPanel title="Employee Salary Register" onSubmit={saveEmployeeSalary} submitLabel="Save Salary"><Field label="Payment Date" name="date" type="date" defaultValue={today} /><Field label="Salary Period" name="period" defaultValue={today.slice(0, 7)} /><Field label="Employee Name" name="employee" /><Field label="Gross Salary" name="gross" type="number" defaultValue={0} /><Field label="Deductions / Advance" name="deductions" type="number" defaultValue={0} /><Field label="Paid By" name="paidBy" options={['Cash', 'Bank', 'Card']} defaultValue="Cash" /><Field label="Status" name="status" options={['Paid', 'Pending']} defaultValue="Paid" /><Field label="Notes" name="notes" required={false} /></FormPanel>
       <section className="register-section"><div className="section-heading"><h3>Employee Salary History</h3></div><DataTable headers={['Date', 'Period', 'Employee', 'Gross', 'Deductions', 'Net Paid', 'Paid By', 'Status']} rows={employeeSalaries.filter((salary) => salary.date >= reportRange.from && salary.date <= reportRange.to).map((salary) => [salary.date, salary.period, salary.employee, money(salary.gross), money(salary.deductions), money(salary.net), salary.paidBy, salary.status])} actions={(rowIndex) => <button className="table-action" type="button" onClick={() => { const visibleSalaries = employeeSalaries.filter((salary) => salary.date >= reportRange.from && salary.date <= reportRange.to); setEmployeeSalaries((current) => current.filter((salary) => salary.id !== visibleSalaries[rowIndex].id)) }}>Delete</button>} /></section>
@@ -769,11 +1156,12 @@ export default function App() {
     selectedTab === 'Fuel Management' ? fuelManagementPage :
     selectedTab === 'Customers' ? customerPage :
     selectedTab === 'Settings' ? settingsPage :
-    selectedTab === 'Reports' || selectedTab === 'Accounting' ? reportsPage :
+    selectedTab === 'Reports' ? reportCenterPage :
+    selectedTab === 'Accounting' ? reportsPage :
     selectedTab === 'Meter Reading' ? (
       <>
-        <FormPanel title="Daily Meter Reading Register" onSubmit={saveMeter}><Field label="Date" name="date" type="date" defaultValue={today} /><Field label="Shift" name="shift" options={['Day', 'Night']} defaultValue="Day" /><Field label="Product" name="product" options={products} defaultValue="HSD" /><Field label="Nozzle" name="nozzle" options={productNozzles.HSD.concat(productNozzles.PMG)} defaultValue="HSD-1" /><Field label="Previous Reading" name="previous" type="number" defaultValue={11800} /><Field label="Present Reading" name="present" type="number" defaultValue={12500} /></FormPanel>
-        <section className="register-section"><div className="section-heading"><h3>Meter Reading History</h3></div><DataTable headers={['Date', 'Shift', 'Nozzle', 'Product', 'Previous', 'Present', 'Total Litres']} rows={meters.map((meter) => [meter.date, meter.shift, meter.nozzle, meter.product, meter.previous, meter.present, meter.litres])} /></section>
+        <section className="register-section meter-print-register"><div className="section-heading"><h3>Daily Meter Reading Register</h3><button className="ghost-button" type="button" onClick={() => printDocument('Daily Meter Reading Register', `${displayDate(dashboardRange.from)} - ${displayDate(dashboardRange.to)}`)}>Print Register</button></div><FormPanel title="Enter Meter Reading" onSubmit={saveMeter}><Field label="Date" name="date" type="date" defaultValue={today} /><Field label="Shift" name="shift" options={['Day', 'Night']} defaultValue="Day" /><Field label="Fuel Type" name="product" options={products} defaultValue="HSD" /><Field label="Nozzle Number / ID" name="nozzle" options={productNozzles.HSD.concat(productNozzles.PMG, productNozzles.XTRON)} defaultValue="HSD-1" /><Field label="Opening Meter Reading" name="previous" type="number" defaultValue={11800} /><Field label="Closing Meter Reading" name="present" type="number" defaultValue={12500} /><Field label="Rate per Litre" name="rate" type="number" defaultValue={285} /></FormPanel></section>
+        <section className="register-section"><div className="section-heading"><h3>Meter Reading History</h3></div><DataTable headers={['Date', 'Shift', 'Nozzle', 'Fuel', 'Opening', 'Closing', 'Litres Sold', 'Rate', 'Amount']} rows={meters.map((meter) => [meter.date, meter.shift, meter.nozzle, meter.product, meter.previous, meter.present, meter.litres, meter.rate === undefined ? '-' : money(meter.rate), meter.amount === undefined ? '-' : money(meter.amount)])} /></section>
       </>
     ) :
     selectedTab === 'Sales' ? (
@@ -789,7 +1177,7 @@ export default function App() {
       </>
     ) :
     selectedTab === 'Daily Operations' ? (
-      <section className="register-section module-placeholder"><h3>Daily Closing & Shift Handover</h3><p>Review the active sales, expenses, meters, and customer balances before closing the shift.</p><div className="summary-strip"><strong>Cash Sale: {money(sales.filter((sale) => sale.mode === 'Cash').reduce((sum, sale) => sum + sale.amount, 0))}</strong><strong>Expenses: {money(expenses.reduce((sum, expense) => sum + expense.amount, 0))}</strong><button className="primary-button" type="button" onClick={() => window.print()}>Print Daily Closing</button></div></section>
+      <section className="register-section module-placeholder"><h3>Daily Closing & Shift Handover</h3><p>Review the active sales, expenses, meters, and customer balances before closing the shift.</p><div className="summary-strip"><strong>Fuel Sales: {money(dailySales.reduce((sum, sale) => sum + sale.amount, 0))}</strong><strong>Fuel Litres: {dailySales.reduce((sum, sale) => sum + sale.litres, 0).toLocaleString()} L</strong><strong>Cash Sale: {money(dailySales.filter((sale) => sale.mode === 'Cash').reduce((sum, sale) => sum + sale.amount, 0))}</strong><strong>Expenses: {money(dailyExpenses.reduce((sum, expense) => sum + expense.amount, 0))}</strong><strong>Commission: {money(dailyCommission)}</strong><strong>Net Result: {money(dailySales.reduce((sum, sale) => sum + sale.amount, 0) - dailyExpenses.reduce((sum, expense) => sum + expense.amount, 0) - dailyCommission)}</strong><button className="primary-button" type="button" onClick={() => printDocument('Daily Closing Report', displayDate(currentSystemDate))}>Print Daily Closing</button></div></section>
     ) :
     selectedTab === 'Mobile Oil' ? (
       <>
@@ -798,28 +1186,98 @@ export default function App() {
       </>
     ) :
     selectedTab === 'Commission' ? (
-      <section className="register-section"><div className="section-heading"><h3>Commission Statement</h3></div><DataTable headers={['Product', 'Litres Sold', 'Commission Rate', 'Commission']} rows={products.map((product) => { const litres = sales.filter((sale) => sale.product === product).reduce((sum, sale) => sum + sale.litres, 0); const rate = product === 'HSD' ? 2.2 : 2.5; return [product, `${litres.toLocaleString()} L`, `${rate}%`, money(litres * rate)] })} /></section>
+      <>
+        <form className="register-section entry-form" onSubmit={saveCommission} onReset={() => { setCommissionPreviewDate(today); setCommissionPreviewProduct('HSD'); setCommissionPreviewLitres('0'); setCommissionPreviewRate('0') }}>
+          <div className="section-heading"><h3>Commission Entry</h3><span className="form-note">Only explicitly entered litres receive commission</span></div>
+          <div className="form-grid">
+            <label className="form-field"><span>Date</span><input name="date" type="date" value={commissionPreviewDate} onChange={(event) => setCommissionPreviewDate(event.target.value)} required /></label>
+            <label className="form-field"><span>Fuel Type</span><select name="product" value={commissionPreviewProduct} onChange={(event) => setCommissionPreviewProduct(event.target.value as Product)} required>{products.map((product) => <option key={product}>{product}</option>)}</select></label>
+            <label className="form-field"><span>Eligible Litres Sold (Calculated)</span><input value={`${commissionDatePreview.toLocaleString()} L`} readOnly aria-describedby="commission-eligibility-help" /><small id="commission-eligibility-help">Taken from sales for the selected date and fuel type, less previous commission entries.</small></label>
+            <label className="form-field"><span>Commissionable Litres (Enter Here)</span><input name="commissionableLitres" type="number" min="0" step="0.01" value={commissionPreviewLitres} onChange={(event) => setCommissionPreviewLitres(event.target.value)} required /><small>Type the litres that should receive commission.</small></label>
+            <label className="form-field"><span>Commission Rate / Litre</span><input name="rate" type="number" min="0" step="0.01" value={commissionPreviewRate} onChange={(event) => setCommissionPreviewRate(event.target.value)} required /></label>
+            <label className="form-field"><span>Commission Amount</span><input value={printMoney(calculateCommissionAmount(Number(commissionPreviewLitres) || 0, Number(commissionPreviewRate) || 0))} readOnly /></label>
+            <label className="form-field"><span>Sales Reference</span><input name="reference" defaultValue="" /></label>
+            <label className="form-field"><span>Notes</span><input name="notes" defaultValue="" /></label>
+          </div>
+          <div className="form-actions"><button className="primary-button" type="submit">Save Commission</button><button className="ghost-button" type="reset">Clear</button></div>
+        </form>
+        <section className="register-section"><div className="section-heading"><h3>Commission Register</h3><button className="ghost-button" type="button" onClick={() => printDocument('Commission Report', `${displayDate(reportRange.from)} - ${displayDate(reportRange.to)}`)}>Print Commission</button></div><DataTable headers={['Date', 'Fuel', 'Eligible Litres', 'Commissionable Litres', 'Rate / Litre', 'Commission', 'Reference']} rows={commissionRangeRecords.map((record) => [record.date, record.product, `${record.eligibleLitres.toLocaleString()} L`, `${record.commissionableLitres.toLocaleString()} L`, money(record.rate), money(record.amount), record.reference || '-'])} actions={(rowIndex) => <button className="table-action" type="button" onClick={() => setCommissionRecords((current) => current.filter((record) => record.id !== commissionRangeRecords[rowIndex].id))}>Delete</button>} /><div className="summary-strip"><strong>Total Eligible: {eligibleCommissionLitresForRange.toLocaleString()} L</strong><strong>Total Commissionable: {commissionLitresForRange.toLocaleString()} L</strong><strong>Remaining Eligible: {Math.max(0, eligibleCommissionLitresForRange - commissionLitresForRange).toLocaleString()} L</strong><strong>Total Commission: {money(commissionAmountForRange)}</strong></div></section>
+      </>
     ) :
     selectedTab === 'Safety Duty' ? (
-      <section className="register-section"><div className="section-heading"><h3>Safety Duty Register</h3></div><DataTable headers={['Nozzle / Duty Point', 'Present Reading', 'Previous Reading', 'Total']} rows={meters.map((meter) => [meter.nozzle, meter.present, meter.previous, meter.litres])} /></section>
+      selectedSafetyProduct ? (
+        <>
+          <section className="register-section safety-summary-header"><div><p className="eyebrow">{selectedSafetyProduct}</p><h3>Safety Duty Summary</h3><p className="form-note">All {selectedSafetyProduct} nozzles · {safetySummaryRange.from} - {safetySummaryRange.to}</p></div><button className="ghost-button" type="button" onClick={() => setSelectedSafetyProduct(null)}>Back to Register</button></section>
+          <section className="register-section safety-summary-controls"><div className="period-picker">{['Today', 'This Week', 'Previous Week', 'Custom'].map((period) => <button key={period} type="button" className={`period-button${safetySummaryPeriod === period ? ' active' : ''}`} onClick={() => setSafetySummaryPeriod(period)}>{period}</button>)}</div>{safetySummaryPeriod === 'Custom' && <div className="period-controls"><label className="form-field"><span>From Date</span><input type="date" value={safetySummaryFrom} onChange={(event) => setSafetySummaryFrom(event.target.value)} /></label><label className="form-field"><span>To Date</span><input type="date" value={safetySummaryTo} onChange={(event) => setSafetySummaryTo(event.target.value)} /></label></div>}<div className="period-picker safety-summary-tabs"><button type="button" className={`period-button${safetySummaryView === 'Daily' ? ' active' : ''}`} onClick={() => setSafetySummaryView('Daily')}>Daily</button><button type="button" className={`period-button${safetySummaryView === 'Weekly' ? ' active' : ''}`} onClick={() => setSafetySummaryView('Weekly')}>Weekly</button></div></section>
+          <section className="dashboard-grid safety-summary-metrics"><div className="metric-card"><span>Today's Total</span><strong>{safetySummaryRecords.filter((meter) => meter.date === currentSystemDate).reduce((sum, meter) => sum + meter.litres, 0).toLocaleString()} L</strong></div><div className="metric-card"><span>Selected Period Total</span><strong>{safetyTotalLitres.toLocaleString()} L</strong></div><div className="metric-card"><span>Entries</span><strong>{safetySummaryRecords.length}</strong></div><div className="metric-card"><span>Average Daily Total</span><strong>{Math.round(safetyAverageDaily).toLocaleString()} L</strong></div></section>
+          <section className="register-section"><div className="section-heading"><h3>{selectedSafetyProduct} - {safetySummaryView} Summary</h3></div>{safetySummaryView === 'Daily' ? <DataTable headers={['Date', 'Opening Reading', 'Closing Reading', 'Total Litres', 'Entries', 'Daily Total']} rows={safetyDailyRows.map((row) => [row.date, row.opening, row.closing, `${row.litres.toLocaleString()} L`, row.entries, `${row.litres.toLocaleString()} L`])} empty="No safety duty records found for this product and date range." /> : <DataTable headers={['Day', 'Total Litres', 'Entries']} rows={safetyWeeklyRows.map((row) => [row.day, `${row.litres.toLocaleString()} L`, row.entries])} empty="No safety duty records found for this product and date range." />}<div className="summary-strip"><strong>{safetySummaryView === 'Daily' ? 'Daily Total' : 'Weekly Total'}: {safetyTotalLitres.toLocaleString()} Liters</strong></div></section>
+        </>
+      ) : (
+        <section className="register-section"><div className="section-heading"><h3>Safety Duty Register</h3><span className="form-note">Summaries combine all nozzles for the selected fuel product.</span></div><DataTable headers={['Fuel Product', 'Nozzle / Duty Point', 'Present Reading', 'Previous Reading', 'Total Litres']} rows={meters.map((meter) => [meter.product, meter.nozzle, meter.present, meter.previous, `${meter.litres.toLocaleString()} L`])} actions={(rowIndex) => <button className="table-action" type="button" onClick={() => { setSelectedSafetyProduct(meters[rowIndex].product); setSafetySummaryPeriod('This Week'); setSafetySummaryView('Daily') }}>View Summary</button>} /></section>
+      )
     ) : <section className="register-section module-placeholder"><h3>{selectedTab}</h3><p>This module is ready for station configuration and its register workflow.</p></section>
 
   return (
     !authUser ? <LoginPanel onLogin={login} error={authError} /> :
-    <div className="ppms-app">
-      <aside className="sidebar">
-        <div className="brand"><span className="brand-mark">A</span><div><h1>Attock</h1><small>Petrol Pump</small></div></div>
-        <nav className="nav"><div className="nav-section"><h3>PPMS Modules</h3>{tabs.filter((tab) => tab !== 'Settings' || authUser.role !== 'operator').map((tab) => <button key={tab} type="button" className={`nav-item ${selectedTab === tab ? 'active' : ''}`} onClick={() => go(tab)}>{tab}</button>)}</div><button className="ghost-button" type="button" onClick={logout}>Sign Out</button></nav>
-      </aside>
-      <main key={selectedTab} className="main-panel">
-        <header className="topbar">
-          <div><p className="eyebrow">Petrol Pump Management System</p><h2>EKHWAN - 1 Filling Station</h2></div>
-          <div className="topbar-actions"><button type="button" className="ghost-button" onClick={() => go('Daily Operations')}>Daily Closing</button><button type="button" className="primary-button" onClick={() => go('Reports')}>Print Report</button></div>
-        </header>
-        {notice && <div className="toast">{notice}</div>}
-        <div className="page-title"><span>Working Register</span><strong>{selectedTab}</strong></div>
-        {content}
-      </main>
-    </div>
+    <>
+      {showChangePassword && <div className="modal-overlay" onClick={() => { setShowChangePassword(false); setChangePasswordError(''); setChangePasswordSuccess(false) }}>
+        <div className="modal-card" onClick={(event) => event.stopPropagation()}>
+          {changePasswordSuccess ? (
+            <div className="modal-card" style={{ textAlign: 'center', padding: '36px 32px' }}>
+              <p style={{ color: '#15803d', fontSize: '1.1rem', fontWeight: 700 }}>✓ Password changed successfully.</p>
+              <p style={{ color: '#526072', fontSize: '0.85rem', marginTop: '8px' }}>You will need to log in again using your new password.</p>
+            </div>
+          ) : (
+            <>
+              <div className="modal-header"><h3>Change Password</h3><button className="modal-close" type="button" onClick={() => { setShowChangePassword(false); setChangePasswordError(''); setChangePasswordSuccess(false) }} aria-label="Close">×</button></div>
+              <form onSubmit={handleChangePassword}>
+                <label className="form-field">
+                  <span>Current Password</span>
+                  <div className="password-field">
+                    <input type={showOldPassword ? 'text' : 'password'} value={changePasswordOld} onChange={(event) => setChangePasswordOld(event.target.value)} placeholder="Enter current password" autoComplete="current-password" required />
+                    <button type="button" className="password-toggle" onClick={() => setShowOldPassword((v) => !v)} aria-label="Toggle password visibility">{showOldPassword ? '🙈' : '👁'}</button>
+                  </div>
+                </label>
+                <label className="form-field">
+                  <span>New Password</span>
+                  <div className="password-field">
+                    <input type={showNewPassword ? 'text' : 'password'} value={changePasswordNew} onChange={(event) => setChangePasswordNew(event.target.value)} placeholder="Enter new password" autoComplete="new-password" required />
+                    <button type="button" className="password-toggle" onClick={() => setShowNewPassword((v) => !v)} aria-label="Toggle password visibility">{showNewPassword ? '🙈' : '👁'}</button>
+                  </div>
+                </label>
+                <label className="form-field">
+                  <span>Confirm New Password</span>
+                  <div className="password-field">
+                    <input type={showConfirmPassword ? 'text' : 'password'} value={changePasswordConfirm} onChange={(event) => setChangePasswordConfirm(event.target.value)} placeholder="Confirm new password" autoComplete="new-password" required />
+                    <button type="button" className="password-toggle" onClick={() => setShowConfirmPassword((v) => !v)} aria-label="Toggle password visibility">{showConfirmPassword ? '🙈' : '👁'}</button>
+                  </div>
+                </label>
+                {changePasswordError && <p className="form-error" style={{ marginTop: '10px' }}>{changePasswordError}</p>}
+                <div className="form-actions" style={{ marginTop: '14px' }}>
+                  <button className="ghost-button" type="button" onClick={() => { setShowChangePassword(false); setChangePasswordError(''); setChangePasswordSuccess(false) }}>Cancel</button>
+                  <button className="primary-button" type="submit">Change Password</button>
+                </div>
+              </form>
+            </>
+          )}
+        </div>
+      </div>}
+      <div className="ppms-app">
+        <aside className={`sidebar${mobileMenuOpen ? ' mobile-open' : ''}`}>
+          <div className="brand"><span className="brand-mark">A</span><div><h1>Attock</h1><small>Petrol Pump</small></div></div>
+          <nav className="nav"><div className="nav-section"><h3>PPMS Modules</h3>{tabs.filter((tab) => tab !== 'Settings' || authUser.role !== 'operator').map((tab) => <button key={tab} type="button" className={`nav-item ${selectedTab === tab ? 'active' : ''}`} onClick={() => go(tab)}>{tab}</button>)}</div><button className="ghost-button" type="button" onClick={logout}>Sign Out</button></nav>
+        </aside>
+        <main key={selectedTab} className="main-panel">
+          <header className="topbar">
+            <div><button type="button" className="mobile-menu-button" aria-label="Open navigation menu" aria-expanded={mobileMenuOpen} onClick={() => setMobileMenuOpen((open) => !open)}>Menu</button><p className="eyebrow">Petrol Pump Management System</p><h2>EKHWAN - 1 Filling Station</h2></div>
+            <div className="topbar-actions"><button type="button" className="ghost-button" onClick={() => go('Daily Operations')}>Daily Closing</button><button type="button" className="primary-button" onClick={() => printDocument(selectedTab === 'Dashboard' ? 'Daily Dashboard Summary' : `${selectedTab} Report`)}>Print Report</button></div>
+          </header>
+          {notice && <div className="toast" role="alert" aria-live="assertive">{notice}</div>}
+          <div className="page-title"><span>Working Register</span><strong>{selectedTab}</strong></div>
+          {content}
+          {printRequest && <PrintDocument request={printRequest} rows={printableReport.rows} headers={printableReport.headers} summary={printableReport.summary} />}
+        </main>
+      </div>
+    </>
   )
 }

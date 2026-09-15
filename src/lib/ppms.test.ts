@@ -9,6 +9,8 @@ import {
   calculateFuelStockSummary,
   calculateDiscountAmount,
   calculatePaymentFee,
+  calculateCommissionAmount,
+  getCommissionTotal,
 } from './ppms'
 
 describe('petrol pump accounting logic', () => {
@@ -75,8 +77,9 @@ describe('petrol pump accounting logic', () => {
 
     expect(result.grossRevenue).toBe(940000)
     expect(result.totalCost).toBe(740000)
-    expect(result.grossProfit).toBe(200000)
-    expect(result.netProfit).toBe(50000)
+    expect(result.grossProfit).toBe(350000)
+    expect(result.operatingExpenses).toBe(150000)
+    expect(result.netProfit).toBe(200000)
   })
 
   it('builds a reusable dashboard summary for a selected range', () => {
@@ -95,6 +98,7 @@ describe('petrol pump accounting logic', () => {
         { id: 1, date: '2026-09-05', customerId: 7, type: 'Credit Sale', reference: 'S-1', description: 'Sale', debit: 145000, credit: 0 },
         { id: 2, date: '2026-09-07', customerId: 7, type: 'Payment Received', reference: 'P-1', description: 'Payment', debit: 0, credit: 50000 },
       ],
+      commission: [{ date: '2026-09-05', amount: 10000 }],
     })
 
     expect(summary.totalSales).toBe(425000)
@@ -102,6 +106,8 @@ describe('petrol pump accounting logic', () => {
     expect(summary.totalExpenses).toBe(65000)
     expect(summary.creditSales).toBe(145000)
     expect(summary.customerPayments).toBe(50000)
+    expect(summary.commission).toBe(10000)
+    expect(summary.netSales).toBe(350000)
   })
 
   it('calculates stock remaining using opening, purchases, sales and adjustments', () => {
@@ -123,6 +129,24 @@ describe('petrol pump accounting logic', () => {
       sold: 8500,
       adjustment: 500,
     }).remaining).toBe(22000)
+  })
+
+  it('calculates commission from explicitly commissionable litres', () => {
+    expect(calculateCommissionAmount(3000, 2)).toBe(6000)
+    expect(calculateCommissionAmount(0, 2)).toBe(0)
+    expect(calculateCommissionAmount(12000, 2)).toBe(24000)
+  })
+
+  it('totals only commission records inside the selected period', () => {
+    expect(getCommissionTotal({
+      startDate: '2026-09-12',
+      endDate: '2026-09-12',
+      records: [
+        { date: '2026-09-11', amount: 5000 },
+        { date: '2026-09-12', amount: 6000 },
+        { date: '2026-09-12', amount: 4000 },
+      ],
+    })).toBe(10000)
   })
 
   it('calculates discounts and payment fees consistently', () => {

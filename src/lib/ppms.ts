@@ -72,6 +72,10 @@ export type DashboardSummaryInput = {
     debit: number
     credit: number
   }>
+  commission?: Array<{
+    date: string
+    amount: number
+  }>
 }
 
 export type FuelStockSummaryInput = {
@@ -92,6 +96,12 @@ export type DiscountInput = {
 export type PaymentFeeInput = {
   amount: number
   feePercent: number
+}
+
+export type CommissionSummaryInput = {
+  startDate: string
+  endDate: string
+  records: Array<{ date: string; amount: number }>
 }
 
 export function calculateMeterTotal(presentReading: number, previousReading: number) {
@@ -162,9 +172,10 @@ export function calculateProfitLoss({
   otherExpenses,
 }: ProfitLossInput) {
   const grossRevenue = fuelRevenue + mobileOilRevenue + otherIncome
-  const totalCost = fuelPurchase + mobileOilPurchase + commission + salaries + electricity + pumpExpenses + otherExpenses
-  const grossProfit = grossRevenue - totalCost
+  const costOfGoods = fuelPurchase + mobileOilPurchase
   const operatingExpenses = commission + salaries + electricity + pumpExpenses + otherExpenses
+  const totalCost = costOfGoods + operatingExpenses
+  const grossProfit = grossRevenue - costOfGoods
   const netProfit = grossProfit - operatingExpenses
 
   return {
@@ -176,10 +187,11 @@ export function calculateProfitLoss({
   }
 }
 
-export function getDashboardSummary({ startDate, endDate, sales, expenses, udhar }: DashboardSummaryInput) {
+export function getDashboardSummary({ startDate, endDate, sales, expenses, udhar, commission: commissionRecords = [] }: DashboardSummaryInput) {
   const filteredSales = sales.filter((sale) => sale.date >= startDate && sale.date <= endDate)
-  const filteredExpenses = expenses.filter((expense) => expense.date >= startDate && expense.date <= endDate)
+  const filteredExpenses = expenses.filter((expense) => expense.date >= startDate && expense.date <= endDate && expense.category !== 'Commission')
   const filteredUdhar = udhar.filter((entry) => entry.date >= startDate && entry.date <= endDate)
+  const commission = getCommissionTotal({ startDate, endDate, records: commissionRecords })
 
   const totalSales = filteredSales.reduce((sum, sale) => sum + sale.amount, 0)
   const totalFuelLitres = filteredSales.reduce((sum, sale) => sum + sale.litres, 0)
@@ -195,11 +207,17 @@ export function getDashboardSummary({ startDate, endDate, sales, expenses, udhar
     cashSales,
     creditSales,
     totalExpenses,
+    commission,
+    operatingExpenses: totalExpenses + commission,
     customerPayments,
     creditPosted,
-    netSales: totalSales - totalExpenses,
+    netSales: totalSales - totalExpenses - commission,
     outstandingReceivables: filteredUdhar.reduce((sum, item) => sum + item.debit - item.credit, 0),
   }
+}
+
+export function getCommissionTotal({ startDate, endDate, records }: CommissionSummaryInput) {
+  return records.filter((record) => record.date >= startDate && record.date <= endDate).reduce((sum, record) => sum + record.amount, 0)
 }
 
 export function calculateFuelStockSummary({ product, opening, purchased, sold, adjustment }: FuelStockSummaryInput) {
@@ -229,4 +247,8 @@ export function calculateDiscountAmount({ litres, rate, discountType, discountVa
 
 export function calculatePaymentFee({ amount, feePercent }: PaymentFeeInput) {
   return Math.max(0, amount) * (Math.max(0, feePercent) / 100)
+}
+
+export function calculateCommissionAmount(commissionableLitres: number, ratePerLitre: number) {
+  return Math.max(0, commissionableLitres) * Math.max(0, ratePerLitre)
 }

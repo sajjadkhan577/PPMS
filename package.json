@@ -1,20 +1,29 @@
 {
   "name": "ppms",
+  "version": "1.0.0",
   "private": true,
-  "version": "0.0.0",
+  "description": "Offline Petrol Pump Management System",
+  "author": "PPMS",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "server": "node server.mjs",
+    "start": "node server.mjs",
     "dev:all": "node server.mjs",
     "build": "tsc && vite build",
+    "electron:dev": "npm run build && electron electron/main.cjs",
+    "dist:win": "npm run build && electron-builder --win",
     "preview": "vite preview",
     "test": "vitest run"
   },
+  "main": "electron/main.cjs",
   "devDependencies": {
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.7",
     "@vitejs/plugin-react": "^6.1.1",
+    "electron": "^36.4.0",
+    "electron-builder": "^26.0.12",
+    "png-to-ico": "^3.0.2",
     "typescript": "~6.0.2",
     "vite": "^8.2.2",
     "vitest": "^5.0.0"
@@ -22,5 +31,22 @@
   "dependencies": {
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
+  },
+  "build": {
+    "appId": "com.ppms.station",
+    "productName": "PPMS",
+    "asar": false,
+    "files": [
+      "dist/**/*",
+      "server.mjs",
+      "electron/**/*",
+      "package.json",
+      "data/**/*"
+    ],
+    "icon": "electron/ppms-icon.ico",
+    "win": {
+      "icon": "electron/ppms-icon.ico",
+      "target": "nsis"
+    }
   }
 }
