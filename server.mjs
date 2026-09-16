@@ -1,5 +1,5 @@
 import { createServer } from 'node:http'
-import { mkdirSync, existsSync, readFileSync, copyFileSync, readdirSync, statSync } from 'node:fs'
+import { mkdirSync, existsSync, readFileSync, copyFileSync, readdirSync, statSync, unlinkSync } from 'node:fs'
 import { basename, dirname, extname, join } from 'node:path'
 import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
@@ -8,12 +8,18 @@ const port = Number(process.env.PPMS_PORT || 8787)
 const appRoot = process.env.PPMS_APP_ROOT || process.cwd()
 const dbPath = process.env.PPMS_DB_PATH || join(appRoot, 'data', 'ppms.sqlite')
 const backupDir = process.env.PPMS_BACKUP_DIR || join(process.env.USERPROFILE || process.env.HOME || appRoot, 'Documents', 'PPMS Backups')
+const dailyBackupDir = join(backupDir, 'Daily')
+const monthlyBackupDir = join(backupDir, 'Monthly')
+const safetyBackupDir = join(backupDir, 'Safety')
 const adminPassword = process.env.PPMS_ADMIN_PASSWORD
 const allowedKeys = new Set(['meters', 'sales', 'customers', 'udhar-transactions', 'expenses', 'employee-salaries', 'purchases', 'oil-sales', 'commission-records', 'discount-rules', 'payment-fees', 'stock-adjustments', 'stock-openings', 'bank-accounts', 'brs-records', 'family-adjustments'])
 const sessions = new Map()
 
 mkdirSync(dirname(dbPath), { recursive: true })
 mkdirSync(backupDir, { recursive: true })
+mkdirSync(dailyBackupDir, { recursive: true })
+mkdirSync(monthlyBackupDir, { recursive: true })
+mkdirSync(safetyBackupDir, { recursive: true })
 let db = new DatabaseSync(dbPath)
 db.exec(`
   PRAGMA journal_mode = WAL;
@@ -62,7 +68,7 @@ function verifyPassword(password, stored) {
 function send(request, response, status, body) {
   const origin = request.headers.origin
   const allowedOrigin = origin && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin) ? origin : 'http://localhost:5173'
-  response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'access-control-allow-origin': allowedOrigin, 'access-control-allow-headers': 'content-type, authorization', 'access-control-allow-methods': 'GET, POST, PUT, OPTIONS', 'vary': 'Origin' })
+  response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'access-control-allow-origin': allowedOrigin, 'access-control-allow-headers': 'content-type, authorization', 'access-control-allow-methods': 'GET, POST, PUT, DELETE, OPTIONS', 'vary': 'Origin' })
   response.end(JSON.stringify(body))
 }
 
@@ -80,6 +86,72 @@ function session(request) {
 
 function audit(user, action, key) {
   db.prepare('INSERT INTO audit_log (id, user_id, action, entity_key, created_at) VALUES (?, ?, ?, ?, ?)').run(randomUUID(), user.id, action, key, new Date().toISOString())
+}
+
+const requiredTables = ['users', 'register_state', 'audit_log']
+
+function backupType(name, filePath) {
+  if (filePath.startsWith(monthlyBackupDir)) return 'Monthly'
+  if (filePath.startsWith(safetyBackupDir)) return 'Safety'
+  if (name.startsWith('PPMS_Monthly_Backup_')) return 'Monthly'
+  if (name.startsWith('PPMS_PreRestore_')) return 'Safety'
+  return 'Daily'
+}
+
+function backupFiles() {
+  const locations = [dailyBackupDir, monthlyBackupDir, safetyBackupDir, backupDir]
+  const files = []
+  for (const location of locations) {
+    if (!existsSync(location)) continue
+    for (const name of readdirSync(location)) {
+      const filePath = join(location, name)
+      if (!statSync(filePath).isFile() || !/^PPMS_(Daily_Backup|Monthly_Backup|PreRestore)_/i.test(name) && !name.endsWith('.sqlite')) continue
+      const stats = statSync(filePath)
+      files.push({ name, path: filePath, type: backupType(name, filePath), createdAt: stats.birthtime.toISOString(), modifiedAt: stats.mtime.toISOString(), size: stats.size })
+    }
+  }
+  return files.filter((entry, index, list) => list.findIndex((candidate) => candidate.path === entry.path) === index).sort((a, b) => b.modifiedAt.localeCompare(a.modifiedAt))
+}
+
+function verifyDatabase(filePath) {
+  if (!existsSync(filePath) || statSync(filePath).size <= 0) throw new Error('Backup verification failed: file is empty or missing.')
+  const candidate = new DatabaseSync(filePath)
+  try {
+    const integrity = candidate.prepare('PRAGMA integrity_check').get()
+    if (!integrity || integrity.integrity_check !== 'ok') throw new Error('Backup verification failed: SQLite integrity check did not pass.')
+    const tables = candidate.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((row) => row.name)
+    if (requiredTables.some((table) => !tables.includes(table))) throw new Error('Backup verification failed: required PPMS tables are missing.')
+  } finally {
+    candidate.close()
+  }
+}
+
+function checkpointDatabase() {
+  db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+}
+
+function copyVerifiedBackup(destination, replace = false) {
+  if (existsSync(destination) && !replace) throw new Error('A backup with this name already exists.')
+  checkpointDatabase()
+  copyFileSync(dbPath, destination)
+  try {
+    verifyDatabase(destination)
+  } catch (error) {
+    if (existsSync(destination)) unlinkSync(destination)
+    throw error
+  }
+}
+
+function requireBackupRole(user, destructive = false) {
+  if (user.role === 'operator' || destructive && user.role !== 'admin') return false
+  return true
+}
+
+function safeBackupEntry(name) {
+  const requested = String(name || '')
+  const entryName = basename(requested)
+  if (!entryName || entryName !== requested || !/^[A-Za-z0-9_.-]+\.(db|sqlite)$/.test(entryName)) return null
+  return backupFiles().find((entry) => entry.name === entryName || decodeURIComponent(entry.name) === entryName) || null
 }
 
 const server = createServer(async (request, response) => {
@@ -137,43 +209,92 @@ const server = createServer(async (request, response) => {
       }
     }
 
+    if (request.method === 'POST' && url.pathname === '/api/auth/change-username') {
+      const input = await body(request)
+      const currentPassword = String(input.currentPassword || '')
+      const username = String(input.username || '').trim()
+      const currentUser = db.prepare('SELECT id, username, password_hash FROM users WHERE id = ? AND active = 1').get(user.id)
+      if (!currentUser || !verifyPassword(currentPassword, currentUser.password_hash)) return send(request, response, 401, { error: 'Current password is incorrect.' })
+      if (!/^[A-Za-z0-9._-]{3,50}$/.test(username)) return send(request, response, 400, { error: 'Username must be 3-50 characters and may contain letters, numbers, dots, underscores, or hyphens.' })
+      const existing = db.prepare('SELECT id FROM users WHERE username = ? AND id <> ?').get(username, user.id)
+      if (existing) return send(request, response, 409, { error: `Username "${username}" is already in use. Choose a different username.` })
+      db.prepare('UPDATE users SET username = ? WHERE id = ?').run(username, user.id)
+      audit(user, 'Username Changed', `${currentUser.username} -> ${username}`)
+      return send(request, response, 200, { ok: true, username })
+    }
+
     if (request.method === 'GET' && url.pathname === '/api/system/status') {
       return send(request, response, 200, { version: process.env.PPMS_VERSION || '0.0.0', databasePath: dbPath, backupDir, databaseExists: existsSync(dbPath) })
     }
 
     if (request.method === 'GET' && url.pathname === '/api/system/backups') {
-      const backups = readdirSync(backupDir).filter((name) => name.endsWith('.sqlite')).map((name) => {
-        const filePath = join(backupDir, name)
-        const stats = statSync(filePath)
-        return { name, createdAt: stats.birthtime.toISOString(), modifiedAt: stats.mtime.toISOString(), size: stats.size }
-      }).sort((a, b) => b.modifiedAt.localeCompare(a.modifiedAt))
-      return send(request, response, 200, { backups })
+      return send(request, response, 200, { backups: backupFiles().map(({ path, ...entry }) => entry), backupDir, dailyBackupDir, monthlyBackupDir, safetyBackupDir })
     }
 
     if (request.method === 'POST' && url.pathname === '/api/system/backup') {
-      db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
-      const name = `ppms-backup-${new Date().toISOString().slice(0, 10)}-${Date.now()}.sqlite`
-      copyFileSync(dbPath, join(backupDir, name))
-      return send(request, response, 201, { name, backupDir })
+      if (!requireBackupRole(user)) return send(request, response, 403, { error: 'Manager or administrator role required.' })
+      const date = new Date().toISOString().slice(0, 10)
+      const name = `PPMS_Daily_Backup_${date}_${new Date().toISOString().slice(11, 19).replaceAll(':', '-')}.db`
+      const destination = join(dailyBackupDir, name)
+      copyVerifiedBackup(destination)
+      audit(user, 'backup-created', name)
+      return send(request, response, 201, { name, type: 'Daily', size: statSync(destination).size, backupDir: dailyBackupDir })
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/system/monthly-backup') {
+      if (!requireBackupRole(user, true)) return send(request, response, 403, { error: 'Administrator role required.' })
+      const input = await body(request)
+      const month = String(input.month || '').match(/^\d{4}-\d{2}$/)?.[0]
+      if (!month) return send(request, response, 400, { error: 'A valid backup month is required.' })
+      const name = `PPMS_Monthly_Backup_${month}.db`
+      const destination = join(monthlyBackupDir, name)
+      if (existsSync(destination) && !input.replace) return send(request, response, 409, { error: `A monthly backup for ${month} already exists.`, name })
+      copyVerifiedBackup(destination, Boolean(input.replace))
+      audit(user, 'monthly-backup-created', name)
+      return send(request, response, 201, { name, type: 'Monthly', month, size: statSync(destination).size, backupDir: monthlyBackupDir })
+    }
+
+    if (request.method === 'DELETE' && url.pathname.startsWith('/api/system/backups/')) {
+      if (!requireBackupRole(user, true)) return send(request, response, 403, { error: 'Administrator role required.' })
+      const entry = safeBackupEntry(decodeURIComponent(url.pathname.slice('/api/system/backups/'.length)))
+      if (!entry) return send(request, response, 404, { error: 'Backup file not found.' })
+      if (entry.type === 'Monthly' && !String(url.searchParams.get('confirmed')).includes('true')) return send(request, response, 409, { error: 'Monthly backup deletion requires explicit confirmation.' })
+      try {
+        unlinkSync(entry.path)
+        audit(user, 'backup-deleted', entry.name)
+        return send(request, response, 200, { ok: true, name: entry.name })
+      } catch {
+        return send(request, response, 500, { error: 'Unable to delete backup. The file may be in use or inaccessible.' })
+      }
     }
 
     if (request.method === 'POST' && url.pathname === '/api/system/restore') {
+      if (!requireBackupRole(user, true)) return send(request, response, 403, { error: 'Administrator role required.' })
       const input = await body(request)
-      const name = basename(String(input.name || ''))
-      if (!name.endsWith('.sqlite')) return send(request, response, 400, { error: 'Invalid backup file.' })
-      const sourcePath = join(backupDir, name)
-      if (!existsSync(sourcePath)) return send(request, response, 404, { error: 'Backup file not found.' })
-      const validationDb = new DatabaseSync(sourcePath)
-      const integrity = validationDb.prepare('PRAGMA integrity_check').get()
-      validationDb.close()
-      if (!integrity || integrity.integrity_check !== 'ok') return send(request, response, 400, { error: 'Backup database failed integrity validation.' })
-      db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
-      const safetyName = `ppms-before-restore-${Date.now()}.sqlite`
-      copyFileSync(dbPath, join(backupDir, safetyName))
-      db.close()
-      copyFileSync(sourcePath, dbPath)
-      db = new DatabaseSync(dbPath)
-      return send(request, response, 200, { ok: true, restored: name, safetyBackup: safetyName })
+      const entry = safeBackupEntry(input.name)
+      if (!entry) return send(request, response, 404, { error: 'Backup file not found.' })
+      const safetyName = `PPMS_PreRestore_${new Date().toISOString().slice(0, 19).replace('T', '_').replaceAll(':', '-')}.db`
+      const safetyPath = join(safetyBackupDir, safetyName)
+      try {
+        verifyDatabase(entry.path)
+        copyVerifiedBackup(safetyPath)
+        db.close()
+        db = null
+        copyFileSync(entry.path, dbPath)
+        db = new DatabaseSync(dbPath)
+        verifyDatabase(dbPath)
+        audit(user, 'backup-restored', entry.name)
+        return send(request, response, 200, { ok: true, restored: entry.name, safetyBackup: safetyName, restartRequired: true })
+      } catch (error) {
+        try {
+          if (db) db.close()
+        } catch { /* Continue with the safety restore attempt. */ }
+        try {
+          if (existsSync(safetyPath)) copyFileSync(safetyPath, dbPath)
+          db = new DatabaseSync(dbPath)
+        } catch { /* Preserve the original restore error for the caller. */ }
+        return send(request, response, 500, { error: error instanceof Error ? error.message : 'Unable to restore backup. The current database was preserved with a safety backup.' })
+      }
     }
 
     if (url.pathname.startsWith('/api/state/')) {

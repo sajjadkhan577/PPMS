@@ -211,7 +211,7 @@ export function getDashboardSummary({ startDate, endDate, sales, expenses, udhar
     operatingExpenses: totalExpenses + commission,
     customerPayments,
     creditPosted,
-    netSales: totalSales - totalExpenses - commission,
+    netSales: totalSales + customerPayments - totalExpenses - commission,
     outstandingReceivables: filteredUdhar.reduce((sum, item) => sum + item.debit - item.credit, 0),
   }
 }

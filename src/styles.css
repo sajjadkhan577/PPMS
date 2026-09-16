@@ -757,6 +757,60 @@ th {
   margin-top: 18px;
 }
 
+.backup-actions {
+  align-items: end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.backup-actions button,
+.backup-filters button {
+  padding: 8px 12px;
+  font-size: 0.82rem;
+  min-height: 36px;
+}
+
+.backup-upload-button {
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+}
+
+.backup-upload-input {
+  display: none;
+}
+
+.backup-actions .form-field,
+.backup-filters .form-field {
+  min-width: 150px;
+  gap: 4px;
+}
+
+.backup-actions .form-field span,
+.backup-filters .form-field span {
+  font-size: 0.7rem;
+}
+
+.backup-filters {
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.backup-table th,
+.backup-table td {
+  padding: 8px 10px;
+}
+
+.backup-row-actions {
+  white-space: nowrap;
+}
+
+.backup-row-actions .table-action {
+  padding: 4px 7px;
+  font-size: 0.75rem;
+}
+
 .login-panel {
   min-height: 100vh;
   display: grid;

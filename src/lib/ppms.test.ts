@@ -19,6 +19,12 @@ describe('petrol pump accounting logic', () => {
     expect(calculateMeterTotal(101500, 100000)).toBe(1500)
   })
 
+  it('preserves decimal meter totals and rates in amount calculations', () => {
+    const litres = calculateMeterTotal(150.75, 100.5)
+    expect(litres).toBe(50.25)
+    expect(litres * 330.59).toBeCloseTo(16612.1475, 10)
+  })
+
   it('calculates fuel sales totals', () => {
     const result = calculateFuelSales([
       { product: 'PMG', litres: 1000, rate: 280 },
@@ -107,7 +113,24 @@ describe('petrol pump accounting logic', () => {
     expect(summary.creditSales).toBe(145000)
     expect(summary.customerPayments).toBe(50000)
     expect(summary.commission).toBe(10000)
-    expect(summary.netSales).toBe(350000)
+    expect(summary.netSales).toBe(400000)
+  })
+
+  it('subtracts discounts from existing expenses', () => {
+    const summary = getDashboardSummary({
+      startDate: '2026-09-01',
+      endDate: '2026-09-30',
+      sales: [],
+      expenses: [
+        { id: 1, date: '2026-09-10', category: 'Maintenance', description: 'Repair', amount: 1000, paidBy: 'Cash' },
+        { id: 2, date: '2026-09-10', category: 'Maintenance', description: 'Discount', amount: -2500, paidBy: 'Discount' },
+      ],
+      udhar: [],
+    })
+
+    expect(summary.totalExpenses).toBe(-1500)
+    expect(summary.operatingExpenses).toBe(-1500)
+    expect(summary.netSales).toBe(1500)
   })
 
   it('calculates stock remaining using opening, purchases, sales and adjustments', () => {
