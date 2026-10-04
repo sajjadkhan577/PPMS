@@ -12,9 +12,10 @@
     "dev:all": "node server.mjs",
     "build": "tsc && vite build",
     "electron:dev": "npm run build && electron electron/main.cjs",
-    "dist:win": "npm run build && electron-builder --win",
+    "dist:win": "node scripts/package-windows.mjs",
     "preview": "vite preview",
-    "test": "vitest run"
+    "test": "vitest run && node --test electron/runtime-paths-check.cjs && node scripts/test-desktop-server.mjs",
+    "desktop:seed": "node scripts/create-desktop-seed.mjs"
   },
   "main": "electron/main.cjs",
   "devDependencies": {
@@ -39,9 +40,18 @@
     "files": [
       "dist/**/*",
       "server.mjs",
-      "electron/**/*",
-      "package.json",
-      "data/**/*"
+      "electron/main.cjs",
+      "electron/preload.cjs",
+      "electron/runtime-paths.cjs",
+      "electron/ppms-icon.ico",
+      "electron/ppms-icon.png",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build-seed/ppms.sqlite",
+        "to": "data/ppms.sqlite"
+      }
     ],
     "icon": "electron/ppms-icon.ico",
     "win": {

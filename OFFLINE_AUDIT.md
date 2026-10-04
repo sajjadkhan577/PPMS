@@ -1,435 +1,66 @@
-# PPMS Offline Audit Report
-
-## 1. Online Dependencies Found
-
-| File | Online Dependency | Purpose | Required? | Offline Replacement |
-| ---- | ----------------- | ------- | --------- | ------------------- |
-| None found | None | None | N/A | N/A |
-
----
-
-## 2. Detailed Audit Results
-
-### 2.1 Tailwind CSS
-
-| Item | Result |
-| ---- | ------ |
-| Was Tailwind CDN being used? | **No** |
-| Tailwind in package.json? | **No** |
-| `@tailwind` or `@apply` directives? | **No** |
-| CDN script in index.html? | **No** |
-| Tailwind in vite.config.ts? | **No** |
-| Tailwind version? | N/A — not used |
-| Local CSS generated? | Custom CSS in `src/styles.css` (no Tailwind) |
-| Production CSS contains external URLs? | **No** |
-
-The project uses **custom CSS only** (no Tailwind). No conversion needed.
-
-### 2.2 index.html
-
-| Check | Result |
-| ---- | ------ |
-| External `<script src="https://...">` | **None** |
-| External `<link href="https://...">` | **None** |
-| External `<link rel="stylesheet">` | **None** |
-| External fonts | **None** |
-| External icon resources | **None** |
-| Remote JavaScript libraries | **None** |
-
-`index.html` is completely self-contained. ✅
-
-### 2.3 External Icons
-
-| Check | Result |
-| ---- | ------ |
-| Font Awesome CDN | **None** |
-| Google Material Icons | **None** |
-| External icon CSS | **None** |
-| Remote SVG URLs | **None** |
-| Icon system used | Local SVG files (`public/icons.svg`, `public/favicon.svg`) + emoji |
-
-All icons are local or emoji-based. No changes needed. ✅
-
-### 2.4 External Fonts
-
-| Check | Result |
-| ---- | ------ |
-| Google Fonts | **None** |
-| fonts.googleapis.com | **None** |
-| fonts.gstatic.com | **None** |
-| Other remote font URLs | **None** |
-| Font stack used | `'Segoe UI', Tahoma, sans-serif` (system fonts) |
-
-Font stack is entirely system fonts. ✅
-
-### 2.5 External Images
-
-| Check | Result |
-| ---- | ------ |
-| Remote images (https://...) | **None** in source |
-| Remote images (http://...) | **None** in source |
-| UI assets | Local: `public/icons.svg`, `public/favicon.svg`, `public/PPMS ICON.jpg` |
-| Logo | Local: `public/PPMS ICON.jpg` |
-| Background images | None used |
-
-All images are local assets. ✅
-
-### 2.6 APIs
-
-| API | Location | Required? | Offline? | Notes |
-| --- | -------- | --------- | -------- | ----- |
-| `POST /api/auth/login` | server.mjs | Core | ✅ Local | Local SQLite auth |
-| `POST /api/auth/logout` | server.mjs | Core | ✅ Local | Local session management |
-| `GET /api/auth/me` | server.mjs | Core | ✅ Local | Session check |
-| `POST /api/auth/change-password` | server.mjs | Core | ✅ Local | Local password change |
-| `GET /api/system/status` | server.mjs | Core | ✅ Local | System info |
-| `GET /api/system/backups` | server.mjs | Core | ✅ Local | Backup management |
-| `POST /api/system/backup` | server.mjs | Core | ✅ Local | Local backup |
-| `POST /api/system/restore` | server.mjs | Core | ✅ Local | Local restore |
-| `GET /api/state/:key` | server.mjs | Core | ✅ Local | State sync |
-| `PUT /api/state/:key` | server.mjs | Core | ✅ Local | State sync |
-| `GET /api/users` | server.mjs | Admin | ✅ Local | User management |
-| `POST /api/users` | server.mjs | Admin | ✅ Local | User creation |
-| `fetch(API_URL)` in App.tsx | App.tsx | Core | ✅ Local | API URL = `http://localhost:8787` |
-
-All APIs are local (localhost:8787). No external API endpoints found. ✅
-
-### 2.7 Date and Time
-
-| Check | Result |
-| ---- | ------ |
-| Online date/time API | **None** |
-| `new Date().toISOString()` usage | 6 occurrences: 3 in server.mjs (DB timestamps), 1 in storage.ts (backup metadata), 1 in main.cjs (log timestamps), 0 in UI logic |
-| UI date calculations | Uses `getSystemDate()` — local system date via `new Date()` with `getFullYear()`, `getMonth()`, `getDate()` |
-| Timezone risk | None — UI uses local date components directly |
-
-All date/time operations use the computer's local system time. ✅
-
-### 2.8 Currency
+# PPMS Offline and Electron Production Audit
 
-| Check | Result |
-| ---- | ------ |
-| Online currency API | **None** |
-| Currency formatting | Local: `Rs. X,XXX` using `toLocaleString('en-PK')` |
-| Exchange rates | Not used |
-
-Currency is local. ✅
-
-### 2.9 Database
-
-| Check | Result |
-| ---- | ------ |
-| Database type | **SQLite** (local file: `data/ppms.sqlite`) |
-| Cloud database | **None** |
-| Remote MySQL | **None** |
-| Firebase/Supabase/MongoDB | **None** |
-| Connection string | `node:sqlite` local driver |
-
-Database is fully local. ✅
-
-### 2.10 Authentication
-
-| Check | Result |
-| ---- | ------ |
-| Auth method | Local (SQLite + sessions + scrypt password hashing) |
-| Google login | **None** |
-| Firebase auth | **None** |
-| Auth0 | **None** |
-| External auth API | **None** |
-| OAuth/SSO | **None** |
-
-Authentication is 100% local. ✅
-
-### 2.11 Email Services
-
-| Check | Result |
-| ---- | ------ |
-| SendGrid | **None** |
-| Resend | **None** |
-| Mailgun | **None** |
-| Gmail API | **None** |
-| SMTP | **None** |
-| Email functionality | **None found in codebase** |
+**Audit date:** 2026-10-03
 
-No email services. ✅
+## Architecture Found
 
-### 2.12 Payment Services
+Electron and electron-builder were already configured. `electron/main.cjs` already launched `server.mjs` through Electron's bundled `utilityProcess`, and the server served the built Vite files and local SQLite API. The production path and lifecycle handling were incomplete: the database used Electron's default roaming `userData` directory, backups went to Documents, the server listened on all interfaces, and readiness accepted any HTTP response on the fixed port.
 
-| Check | Result |
-| ---- | ------ |
-| Stripe | **None** |
-| PayPal | **None** |
-| Payment gateway | **None** |
-| Payment processing | Local cash/credit recording only |
+| Area | Production behavior |
+| --- | --- |
+| UI | Built React/Vite assets from the packaged `dist` directory |
+| Local API | Electron starts bundled `server.mjs`; loopback only, fixed port `127.0.0.1:8787` |
+| Database | `%LOCALAPPDATA%\PPMS\data\ppms.sqlite` |
+| Backups | `%LOCALAPPDATA%\PPMS\backups\Daily`, `Monthly`, and `Safety` |
+| Logs | `%LOCALAPPDATA%\PPMS\logs` |
+| Login | Existing SQLite users and scrypt hashes; Electron opens the Login view first |
+| Packaged runtime | Electron's embedded Node runtime; no system Node/npm required |
 
-No external payment services. ✅
-
-### 2.13 Analytics / Telemetry
+Development retains the project-local `data`, `backups`, and `logs` folders. Production does not use `process.cwd()` for application or business-data paths.
 
-| Check | Result |
-| ---- | ------ |
-| Google Analytics | **None** |
-| Tracking scripts | **None** |
-| Telemetry SDKs | **None** |
-| Error reporting services | **None** |
-| External monitoring | **None** |
-
-No analytics/telemetry. ✅
-
-### 2.14 Package Dependencies
+## Network Dependencies
 
-#### Production Dependencies (package.json `dependencies`)
+| Dependency | Location | Purpose | Required for core PPMS? | Offline replacement / status |
+| --- | --- | --- | --- | --- |
+| `fetch` to `http://127.0.0.1:8787` | `src/App.tsx` | Existing local authentication, state sync, status, and backup APIs | Yes | Remains local; packaged Electron starts the API automatically |
+| Health `fetch` to `http://127.0.0.1:8787/api/health` | `electron/main.cjs` | Verify that this Electron instance's local server is ready before opening the window | Yes | Loopback-only handshake includes a per-launch token |
+| Local HTTP listener | `server.mjs` | Serves PPMS assets and the SQLite API | Yes | Binds to `127.0.0.1`, not a public interface |
+| `http://` / `https://` package registry URLs | `package-lock.json` | Dependency retrieval during development/build installation | Build-time only | Not present in the packaged runtime; `npm ci` may require network/cache |
+| `http://www.w3.org/...` SVG namespace identifiers | Local SVG assets | XML namespace declarations | No network request | Local files; not fetched URLs |
 
-| Package | Required for Offline? | Type | Notes |
-| ------- | --------------------- | ---- | ----- |
-| `react` ^19.2.8 | ✅ REQUIRED | Core | React UI framework — fully offline after install |
-| `react-dom` ^19.2.8 | ✅ REQUIRED | Core | React DOM rendering — fully offline after install |
+No app runtime `axios`, `XMLHttpRequest`, WebSocket, CDN script/style, remote font/image, cloud database, analytics, telemetry, or external authentication dependency was found in shipped source. The UI font stack uses installed system fonts. Generated browser profiles, `node_modules`, `dist`, and hidden worktrees are not application runtime dependencies.
 
-#### Development Dependencies (package.json `devDependencies`)
+## Database Safety
 
-| Package | Required for Offline? | Type | Notes |
-| ------- | --------------------- | ---- | ----- |
-| `@types/react` | Development only | Dev | TypeScript types |
-| `@types/react-dom` | Development only | Dev | TypeScript types |
-| `@vitejs/plugin-react` | Development only | Dev | Vite React plugin |
-| `electron` ^36.4.0 | Build/Run | Core | Electron packaging |
-| `electron-builder` | Build only | Build | Electron packaging tool |
-| `png-to-ico` | Build only | Build | Icon conversion |
-| `typescript` ~6.0.2 | Development only | Dev | TypeScript compiler |
-| `vite` ^8.2.2 | Development/Build | Core | Build tool |
-| `vitest` ^5.0.0 | Development/Test | Dev | Test runner |
+- Existing database files are never copied over an existing LocalAppData database.
+- On first packaged startup, if the target database does not exist, the server searches the prior Electron roaming `userData` location and then the verified package snapshot.
+- Migration uses SQLite's online backup API so committed WAL content is included. It verifies integrity and required tables before opening the migrated target; the source remains intact.
+- If an existing target is invalid, or no usable packaged/legacy database is found, startup fails clearly instead of silently presenting a new empty database.
+- Windows package creation snapshots `data/ppms.sqlite` read-only into an ignored build staging directory, checks integrity and the presence of at least one login account, then includes the snapshot as a resource. The live database and its WAL are not placed in the writable install directory.
 
-No packages require internet at runtime. All packages are either:
-- Core framework libraries (React, Vite) — bundled locally
-- Build tools (TypeScript, electron-builder) — used during development/build
-- Development utilities — not shipped to production
+The Windows package is intended to carry the station's existing database snapshot. Treat the resulting installer as containing business data and distribute it only through the station's approved secure process.
 
-All packages work offline once installed via `npm install`. ✅
+## Startup, Port, and Security
 
-### 2.15 Vite Configuration
+- Electron enforces one app instance, starts the local server, waits for the exact per-launch health token, and then opens PPMS.
+- Port `8787` is fixed because the current React API client uses that port. If another process owns it, PPMS reports startup failure rather than connecting to that process.
+- Server startup/database errors are recorded under the PPMS logs directory; the GUI shows a user-friendly error and log path, not a stack trace.
+- The local server is not exposed to the LAN. Existing login and role checks remain in SQLite-backed server routes.
+- Closing PPMS requests graceful server shutdown; the main process also has a bounded cleanup timeout.
 
-| Check | Result |
-| ---- | ------ |
-| External CSS/JS in build | **None** |
-| CDN references in build | **None** |
-| Build output is self-contained | ✅ Yes — JS/CSS bundled to `dist/assets/` |
-| `vite.config.ts` external refs | **None** |
+## Build-Time and Runtime Distinction
 
-Production build generates fully local assets. ✅
+The end-user application does not require VS Code, Node.js, npm, source code, Git, a web server installation, or internet. `electron-builder`/Electron downloads and npm registry access can be required on the developer/build machine unless dependencies and Electron binaries are cached. The app itself uses local packaged UI assets, the bundled Electron Node runtime, and local SQLite.
 
-### 2.16 Server (server.mjs)
+## Verification Status
 
-| Check | Result |
-| ---- | ------ |
-| External API calls | **None** |
-| External service connections | **None** |
-| Startup internet requirement | **None** |
-| Uses Node.js built-in modules only | ✅ (`node:http`, `node:fs`, `node:crypto`, `node:sqlite`, `node:path`) |
-| Database path | Local: `data/ppms.sqlite` |
-| Backup path | Local: Documents/PPMS Backups |
+The source audit confirms the application runtime uses only loopback requests and local assets.
 
-Server is 100% local. ✅
+- `npm test`: 44 Vitest tests, 4 runtime-path tests, and the desktop-server migration/restart smoke test passed.
+- `npm run build`: passed.
+- `npm run dist:win`: produced `dist/PPMS Setup 1.0.0.exe` and `dist/win-unpacked/PPMS.exe` with the verified database resource.
+- The extracted packaged server was launched from a working directory outside its install tree using a temporary LocalAppData substitute. Migration, the exact health token, local UI serving, SQLite integrity, graceful stop/restart, and record counts passed.
+- Electron's embedded Node 22.19.0 exposes `node:sqlite` `DatabaseSync` and `backup`.
+- The GUI executable was not launched because an existing `node server.mjs` process owns fixed port 8787; it was not stopped. A physical Wi-Fi-disconnected Login-to-module session was not performed.
 
-### 2.17 Electron Compatibility
-
-| Check | Result |
-| ---- | ------|
-| Browser internet access assumed | **None** |
-| Remote CDN usage | **None** |
-| External API calls | **None** |
-| External authentication | **None** |
-| Remote database | **None** |
-| Server starts on app launch | ✅ Yes (via `utilityProcess.fork`) |
-| Loads local URL | ✅ `http://localhost:${port}/` |
-
-Electron architecture is fully local. ✅
-
----
-
-## 3. Network Request Analysis (Production Build)
-
-### JS Bundle (`dist/assets/index-DNZR1-wn.js`)
-
-| URL Found | Type | External? | Impact |
-| --------- | ---- | --------- | ------ |
-| `https://react.dev/errors/` | React error documentation string | No | ❌ Not a network call — string constant for error code URLs, never fetched |
-| `http://www.w3.org/2000/svg` | XML namespace | No | ❌ XML namespace identifier, not a network URL |
-| `http://www.w3.org/1998/Math/MathML` | XML namespace | No | ❌ XML namespace identifier |
-| `http://www.w3.org/1999/xlink` | XML namespace | No | ❌ XML namespace identifier |
-| `http://www.w3.org/XML/1998/namespace` | XML namespace | No | ❌ XML namespace identifier |
-| `http://localhost` (x2) | API + Vite preload | No | ✅ Local — API calls and module preload |
-
-### CSS Bundle (`dist/assets/index-C37YQDcP.css`)
-
-| URL Found | Type | External? | Impact |
-| --------- | ---- | --------- | ------ |
-| NONE | — | ✅ No external URLs | Fully local CSS ✅ |
-
-### Actual Network Requests at Runtime
-
-| Request | Target | External? |
-| ------- | ------ | --------- |
-| `fetch('/api/auth/login', ...)` | `http://localhost:8787` | ✅ Local |
-| `fetch('/api/state/...', ...)` | `http://localhost:8787` | ✅ Local |
-| Vite module preload `fetch(...)` | Local JS/CSS files | ✅ Local |
-| Electron `fetch('http://localhost:...')` | Local server health check | ✅ Local |
-
-**No external domain requests during normal operation.** ✅
-
----
-
-## 4. Offline Startup Test Results
-
-### Test: npm run dev
-
-**Expected**: PPMS opens successfully
-**Result**: ✅ PASS — Server starts, Vite dev server starts, app loads
-
-### Test: Login
-
-**Expected**: Admin login works offline
-**Result**: ✅ PASS — `admin` / `change-me-now` works, session established
-
-### Test: Dashboard
-
-**Expected**: Dashboard loads with metrics
-**Result**: ✅ PASS — All metrics from local data
-
-### Test: Sales
-
-**Expected**: Sales register works
-**Result**: ✅ PASS — CRUD operations on local SQLite
-
-### Test: Meter Reading
-
-**Expected**: Meter readings work
-**Result**: ✅ PASS — Local data operations
-
-### Test: Fuel Management
-
-**Expected**: Fuel stock/operations work
-**Result**: ✅ PASS — Local data operations
-
-### Test: Customers
-
-**Expected**: Customer management works
-**Result**: ✅ PASS — Local data operations
-
-### Test: Expenses
-
-**Expected**: Expense entry works
-**Result**: ✅ PASS — Local data operations
-
-### Test: Mobile Oil
-
-**Expected**: Mobile oil sales work
-**Result**: ✅ PASS — Local data operations
-
-### Test: Commission
-
-**Expected**: Commission entries work
-**Result**: ✅ PASS — Local data operations
-
-### Test: Safety Duty
-
-**Expected**: Safety duty register works
-**Result**: ✅ PASS — Local data operations
-
-### Test: Reports
-
-**Expected**: Reports generate from local data
-**Result**: ✅ PASS — All reports use local SQLite data
-
-### Test: Accounting
-
-**Expected**: Accounting work
-**Result**: ✅ PASS — Local data operations
-
-### Test: BRS
-
-**Expected**: BRS reconciliation works
-**Result**: ✅ PASS — Local data operations
-
-### Test: Settings
-
-**Expected**: Settings page works (admin only)
-**Result**: ✅ PASS — Admin features functional
-
-### Test: Daily Closing
-
-**Expected**: Daily closing works
-**Result**: ✅ PASS — Local data display
-
-### Test: Printing
-
-**Expected**: Print dialog opens
-**Result**: ✅ PASS — Uses browser print API (local)
-
-### Test: Database
-
-**Expected**: SQLite DB accessible
-**Result**: ✅ PASS — `data/ppms.sqlite` local file
-
-### Test: API Requests
-
-**Expected**: All API calls to localhost:8787
-**Result**: ✅ PASS — All requests local, zero external domain calls
-
-### Test: Offline/No-Internet
-
-**Expected**: PPMS fully functional with internet disabled
-**Result**: ✅ PASS — No internet dependency for any core feature
-
----
-
-## 5. Production Build Test Results
-
-### npm run build
-
-**Result**: ✅ PASS
-- TypeScript compiles with no errors
-- Vite builds successfully
-- Output: `dist/index.html`, `dist/assets/index-*.js`, `dist/assets/index-*.css`
-- All assets are local (no CDN references)
-- CSS bundle: 13.33 kB (no external URLs)
-- JS bundle: 280.87 kB (only localhost URLs)
-
-### Production Server
-
-**Result**: ✅ PASS — `node server.mjs` serves local build from `dist/`
-
----
-
-## 6. Remaining Internet Dependencies
-
-**NONE** — PPMS core application requires zero internet connectivity.
-
-The only scenarios that may require internet in the future (as noted in requirements):
-- Software updates
-- Remote backup (optional future feature)
-- Cloud synchronization (optional future feature)
-- Optional online services
-
-These are explicitly out of scope for core PPMS operation.
-
----
-
-## 7. Summary
-
-| Category | Status |
-| -------- | ------ |
-| Tailwind CDN | Not used (custom CSS only) |
-| External fonts | Not used (system fonts) |
-| External icons | Not used (local SVGs + emoji) |
-| External images | Not used (local assets) |
-| External APIs | None — all localhost |
-| External auth | None — local SQLite |
-| Cloud database | None — local SQLite |
-| Analytics/telemetry | None |
-| Email services | None |
-| Payment APIs | None |
-| Date/time API | Local system time |
-| Currency API | None — local formatting |
-| Server external calls | None |
-| Build external deps | None |
-| **Overall** | **✅ FULLY OFFLINE** |
+These limits mean that offline runtime behavior is supported by source audit and local-server tests, but an actual disconnected Electron GUI session remains to be verified when port 8787 is available.

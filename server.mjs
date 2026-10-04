@@ -1,57 +1,125 @@
 import { createServer } from 'node:http'
-import { mkdirSync, existsSync, readFileSync, copyFileSync, readdirSync, statSync, unlinkSync } from 'node:fs'
+import { mkdirSync, existsSync, readFileSync, copyFileSync, readdirSync, statSync, unlinkSync, appendFileSync } from 'node:fs'
 import { basename, dirname, extname, join } from 'node:path'
 import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto'
-import { DatabaseSync } from 'node:sqlite'
+import { DatabaseSync, backup } from 'node:sqlite'
 
 const port = Number(process.env.PPMS_PORT || 8787)
+const host = process.env.PPMS_HOST || '127.0.0.1'
+const desktopProduction = process.env.PPMS_DESKTOP === '1'
+if (desktopProduction && (!process.env.PPMS_APP_ROOT || !process.env.PPMS_DB_PATH || !process.env.PPMS_BACKUP_DIR || !process.env.PPMS_LOG_DIR)) {
+  throw new Error('The packaged PPMS server is missing its application-data paths.')
+}
 const appRoot = process.env.PPMS_APP_ROOT || process.cwd()
 const dbPath = process.env.PPMS_DB_PATH || join(appRoot, 'data', 'ppms.sqlite')
-const backupDir = process.env.PPMS_BACKUP_DIR || join(process.env.USERPROFILE || process.env.HOME || appRoot, 'Documents', 'PPMS Backups')
+const dataDir = dirname(dbPath)
+const backupDir = process.env.PPMS_BACKUP_DIR || join(appRoot, 'backups')
+const logDir = process.env.PPMS_LOG_DIR || join(dirname(dataDir), 'logs')
+const logPath = join(logDir, 'ppms-server.log')
 const dailyBackupDir = join(backupDir, 'Daily')
 const monthlyBackupDir = join(backupDir, 'Monthly')
 const safetyBackupDir = join(backupDir, 'Safety')
 const adminPassword = process.env.PPMS_ADMIN_PASSWORD
-const allowedKeys = new Set(['meters', 'sales', 'customers', 'udhar-transactions', 'expenses', 'employee-salaries', 'purchases', 'oil-sales', 'commission-records', 'discount-rules', 'payment-fees', 'stock-adjustments', 'stock-openings', 'bank-accounts', 'brs-records', 'family-adjustments'])
+const legacyDatabasePaths = String(process.env.PPMS_LEGACY_DB_PATHS || '').split(process.platform === 'win32' ? ';' : ':').filter(Boolean)
+const allowedKeys = new Set(['meters', 'meter-calibrations', 'sales', 'customers', 'udhar-transactions', 'expenses', 'employee-salaries', 'purchases', 'oil-sales', 'commission-records', 'discount-rules', 'payment-fees', 'stock-adjustments', 'stock-openings', 'bank-accounts', 'brs-records', 'family-adjustments'])
 const sessions = new Map()
+const requiredTables = ['users', 'register_state', 'audit_log']
 
-mkdirSync(dirname(dbPath), { recursive: true })
+mkdirSync(dataDir, { recursive: true })
 mkdirSync(backupDir, { recursive: true })
 mkdirSync(dailyBackupDir, { recursive: true })
 mkdirSync(monthlyBackupDir, { recursive: true })
 mkdirSync(safetyBackupDir, { recursive: true })
-let db = new DatabaseSync(dbPath)
-db.exec(`
-  PRAGMA journal_mode = WAL;
-  CREATE TABLE IF NOT EXISTS users (
-    id TEXT PRIMARY KEY,
-    username TEXT NOT NULL UNIQUE,
-    password_hash TEXT NOT NULL,
-    role TEXT NOT NULL CHECK (role IN ('admin', 'manager', 'operator')),
-    active INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS register_state (
-    key TEXT PRIMARY KEY,
-    value_json TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    updated_by TEXT NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS audit_log (
-    id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    action TEXT NOT NULL,
-    entity_key TEXT NOT NULL,
-    created_at TEXT NOT NULL
-  );
-`)
+mkdirSync(logDir, { recursive: true })
+
+function writeLog(level, message) {
+  try {
+    appendFileSync(logPath, `${new Date().toISOString()} ${level} ${message}\n`)
+  } catch { /* Logging failure must not hide the original database/server failure. */ }
+}
+
+function databaseTables(database) {
+  return database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((row) => row.name)
+}
+
+async function migrateLegacyDatabase() {
+  if (existsSync(dbPath)) return
+  const legacyPath = legacyDatabasePaths.find((candidate) => existsSync(candidate))
+  if (!legacyPath) {
+    if (desktopProduction) throw new Error(`The PPMS database was not found at ${dbPath}; no existing database was changed.`)
+    return
+  }
+
+  let source
+  try {
+    source = new DatabaseSync(legacyPath, { readOnly: true })
+    const tables = databaseTables(source)
+    if (requiredTables.some((table) => !tables.includes(table))) throw new Error('The existing database is missing required PPMS tables.')
+    await backup(source, dbPath)
+  } catch (error) {
+    writeLog('ERROR', `Database migration from ${legacyPath} failed: ${error instanceof Error ? error.message : String(error)}`)
+    throw new Error('PPMS could not safely migrate the existing database. The original data was left untouched.')
+  } finally {
+    source?.close()
+  }
+
+  try {
+    verifyDatabase(dbPath)
+  } catch (error) {
+    try { unlinkSync(dbPath) } catch { /* Keep the original database untouched if cleanup is unavailable. */ }
+    writeLog('ERROR', `Migrated database verification failed: ${error instanceof Error ? error.message : String(error)}`)
+    throw new Error('The migrated PPMS database did not pass integrity verification. The source database was left untouched.')
+  }
+  writeLog('INFO', `Migrated existing database from ${legacyPath} to ${dbPath}`)
+}
+
+await migrateLegacyDatabase()
+
+let db
+try {
+  const databaseAlreadyExists = existsSync(dbPath)
+  db = new DatabaseSync(dbPath)
+  if (databaseAlreadyExists && requiredTables.some((table) => !databaseTables(db).includes(table))) {
+    throw new Error('The existing database is missing required PPMS tables.')
+  }
+  db.exec(`
+    PRAGMA journal_mode = WAL;
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      username TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      role TEXT NOT NULL CHECK (role IN ('admin', 'manager', 'operator')),
+      active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS register_state (
+      key TEXT PRIMARY KEY,
+      value_json TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      updated_by TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS audit_log (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      action TEXT NOT NULL,
+      entity_key TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+  `)
+  const integrity = db.prepare('PRAGMA quick_check').get()?.quick_check
+  if (integrity !== 'ok') throw new Error('SQLite quick_check failed.')
+} catch (error) {
+  try { db?.close() } catch { /* Preserve the initialization error for logging. */ }
+  writeLog('ERROR', `Database initialization failed at ${dbPath}: ${error instanceof Error ? error.stack || error.message : String(error)}`)
+  throw new Error('PPMS could not open or initialize its database. Existing database files were not replaced.')
+}
 
 if (!db.prepare('SELECT id FROM users LIMIT 1').get()) {
   if (adminPassword) {
     db.prepare('INSERT INTO users (id, username, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)').run(randomUUID(), 'admin', hashPassword(adminPassword), 'admin', new Date().toISOString())
-    console.warn('PPMS admin account created from PPMS_ADMIN_PASSWORD.')
+    writeLog('INFO', 'Initial admin account created from PPMS_ADMIN_PASSWORD.')
   } else {
-    console.warn('No PPMS users exist. Set PPMS_ADMIN_PASSWORD for the first admin account.')
+    writeLog('WARN', 'No PPMS users exist. Configure PPMS_ADMIN_PASSWORD or restore an existing PPMS database before login.')
   }
 }
 
@@ -87,8 +155,6 @@ function session(request) {
 function audit(user, action, key) {
   db.prepare('INSERT INTO audit_log (id, user_id, action, entity_key, created_at) VALUES (?, ?, ?, ?, ?)').run(randomUUID(), user.id, action, key, new Date().toISOString())
 }
-
-const requiredTables = ['users', 'register_state', 'audit_log']
 
 function backupType(name, filePath) {
   if (filePath.startsWith(monthlyBackupDir)) return 'Monthly'
@@ -158,6 +224,13 @@ const server = createServer(async (request, response) => {
   try {
     const url = new URL(request.url, `http://${request.headers.host || 'localhost'}`)
     if (request.method === 'OPTIONS') return send(request, response, 204, {})
+    if (request.method === 'GET' && url.pathname === '/api/health') {
+      return send(request, response, 200, {
+        service: 'ppms-local-server',
+        startupToken: process.env.PPMS_STARTUP_TOKEN || '',
+        usersReady: Boolean(db.prepare('SELECT id FROM users LIMIT 1').get()),
+      })
+    }
     if (request.method === 'GET' && !url.pathname.startsWith('/api/')) {
       const relativePath = url.pathname === '/' ? 'index.html' : url.pathname.slice(1)
       const filePath = join(appRoot, 'dist', relativePath)
@@ -338,9 +411,42 @@ const server = createServer(async (request, response) => {
 
     send(request, response, 404, { error: 'Not found.' })
   } catch (error) {
-    console.error(error)
-    send(request, response, 400, { error: error instanceof Error ? error.message : 'Request failed.' })
+    writeLog('ERROR', `Request ${request.method} failed: ${error instanceof Error ? error.stack || error.message : String(error)}`)
+    send(request, response, 500, { error: 'The request could not be completed. Check the PPMS local diagnostic log.' })
   }
 })
 
-server.listen(port, () => console.log(`PPMS database server listening on http://localhost:${port}`))
+server.on('error', (error) => {
+  writeLog('ERROR', `Local server failed to listen on ${host}:${port}: ${error.stack || error.message}`)
+  process.exitCode = 1
+  process.exit()
+})
+
+server.listen(port, host, () => writeLog('INFO', `PPMS database server listening on http://${host}:${port}; database=${dbPath}; backups=${backupDir}`))
+
+let shuttingDown = false
+function shutdown() {
+  if (shuttingDown) return
+  shuttingDown = true
+  const timeout = setTimeout(() => {
+    writeLog('ERROR', 'Graceful server shutdown timed out.')
+    process.exit(1)
+  }, 4000)
+  timeout.unref()
+  try {
+    server.close(() => {
+      clearTimeout(timeout)
+      try { db.close() } catch (error) { writeLog('ERROR', `Database close failed: ${error instanceof Error ? error.message : String(error)}`) }
+      writeLog('INFO', 'PPMS local server stopped.')
+      process.exit(0)
+    })
+  } catch (error) {
+    clearTimeout(timeout)
+    writeLog('ERROR', `Server shutdown failed: ${error instanceof Error ? error.message : String(error)}`)
+    try { db.close() } catch { /* Continue stopping after a server close failure. */ }
+    process.exit(1)
+  }
+}
+
+process.once('SIGTERM', shutdown)
+process.once('SIGINT', shutdown)
