@@ -22,9 +22,6 @@ try {
   succeeded = true
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error))
-} finally {
-  for (const suffix of ['', '-wal', '-shm']) rmSync(`${seedPath}${suffix}`, { force: true })
-  try { rmdirSync(seedDirectory) } catch { /* Preserve unrelated files if the directory is not empty. */ }
 }
 
 if (!succeeded) process.exitCode = 1

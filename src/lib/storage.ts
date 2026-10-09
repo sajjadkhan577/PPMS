@@ -43,13 +43,16 @@ export function createBackup(storage: StorageLike, keys: string[]) {
 }
 
 export function restoreBackup(storage: StorageLike, backup: string, keys: string[]) {
+  const data = parseBackup(backup, keys)
+  for (const [key, value] of Object.entries(data)) writeStored(storage, key, value)
+}
+
+export function parseBackup(backup: string, keys: string[]) {
   const parsed: unknown = JSON.parse(backup)
   if (!isBackup(parsed)) throw new Error('Invalid PPMS backup file.')
 
   const allowed = new Set(keys)
-  for (const [key, value] of Object.entries(parsed.data)) {
-    if (allowed.has(key)) writeStored(storage, key, value)
-  }
+  return Object.fromEntries(Object.entries(parsed.data).filter(([key]) => allowed.has(key)))
 }
 
 function isEnvelope<T>(value: unknown): value is StorageEnvelope<T> {

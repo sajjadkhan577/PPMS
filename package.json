@@ -14,7 +14,7 @@
     "electron:dev": "npm run build && electron electron/main.cjs",
     "dist:win": "node scripts/package-windows.mjs",
     "preview": "vite preview",
-    "test": "vitest run && node --test electron/runtime-paths-check.cjs && node scripts/test-desktop-server.mjs",
+    "test": "vitest run && node --test electron/runtime-paths-check.cjs && node scripts/test-desktop-server.mjs && node scripts/test-security-api.mjs",
     "desktop:seed": "node scripts/create-desktop-seed.mjs"
   },
   "main": "electron/main.cjs",
@@ -56,7 +56,20 @@
     "icon": "electron/ppms-icon.ico",
     "win": {
       "icon": "electron/ppms-icon.ico",
-      "target": "nsis"
+      "target": "nsis",
+      "artifactName": "PPMS Setup ${version}.exe"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "PPMS",
+      "uninstallDisplayName": "PPMS",
+      "installerIcon": "electron/ppms-icon.ico",
+      "uninstallerIcon": "electron/ppms-icon.ico",
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false
     }
   }
 }

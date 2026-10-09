@@ -1,7 +1,7 @@
-import { FormEvent, ReactNode, useEffect, useMemo, useState } from 'react'
+import { FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 import './styles.css'
 import { calculateCommissionAmount, calculateCompanyFleetSummary, calculateDiscountAmount, calculateFuelStockSummary, calculateMeterPeriodSummary, calculateMeterTotal, calculatePaymentFee, calculateVehicleUsageSummary, findPreviousMeterReading, getCommissionTotal, getDashboardDateRange, getDashboardSummary, getMeterTestsForReading, normalizeLocalCalendarDate, recalculateMeterReadingChain, type MeterTestEntry } from './lib/ppms'
-import { createBackup, readStored, restoreBackup, writeStored } from './lib/storage'
+import { createBackup, parseBackup, readStored, restoreBackup, writeStored } from './lib/storage'
 
 type Product = 'HSD' | 'PMG' | 'XTRON'
 type DiscountType = 'percent' | 'fixed'
@@ -192,28 +192,59 @@ async function apiRequest<T>(path: string, options: RequestInit = {}) {
   const token = localStorage.getItem('ppms-session-token')
   const response = await fetch(`${API_URL}${path}`, { ...options, headers: { 'content-type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(options.headers || {}) } })
   const payload = await response.json() as T & { error?: string }
-  if (!response.ok) throw new Error(payload.error || 'Request failed.')
+  if (!response.ok) {
+    const error = new Error(payload.error || 'Request failed.') as Error & { status: number }
+    error.status = response.status
+    throw error
+  }
   return payload
 }
 
 function useStored<T>(key: string, initial: T, normalize: (value: unknown) => T = (value) => value as T) {
   const remoteToken = localStorage.getItem('ppms-session-token')
+  const storedUser = (() => {
+    try { return JSON.parse(localStorage.getItem('ppms-session-user') || '{}') as { role?: string } } catch { return {} }
+  })()
+  const restrictedKeys = ['commission-records', 'discount-rules', 'payment-fees', 'bank-accounts', 'brs-records', 'family-adjustments', 'stock-openings']
+  const canRead = key === 'employee-salaries' ? storedUser.role === 'admin'
+    : restrictedKeys.includes(key) ? storedUser.role === 'admin' || storedUser.role === 'manager'
+      : true
   const [remoteReady, setRemoteReady] = useState(!remoteToken)
   const [value, setValue] = useState<T>(() => {
-    return readStored(localStorage, `ppms-${key}`, initial, normalize)
+    return canRead ? readStored(localStorage, `ppms-${key}`, initial, normalize) : initial
   })
+  const version = useRef<number | null>(null)
+  const saveQueue = useRef<Promise<void>>(Promise.resolve())
   useEffect(() => {
-    if (!remoteToken) return
-    apiRequest<{ value: unknown }>(`/api/state/${key}`).then((payload) => {
+    if (!remoteToken || !canRead) {
+      if (remoteToken && !canRead) {
+        version.current = null
+        setValue(initial)
+      }
+      setRemoteReady(true)
+      return
+    }
+    apiRequest<{ value: unknown; version: number }>(`/api/state/${key}`).then((payload) => {
+      version.current = payload.version
       if (payload.value !== null) setValue(normalize(payload.value))
-    }).catch(() => undefined).finally(() => setRemoteReady(true))
-  }, [key, remoteToken])
+    }).catch((error: Error) => {
+      window.dispatchEvent(new CustomEvent('ppms-request-error', { detail: error.message }))
+    }).finally(() => setRemoteReady(true))
+  }, [canRead, key, remoteToken])
   useEffect(() => {
     if (!remoteReady) return
+    if (remoteToken && (!canRead || version.current === null)) return
     writeStored(localStorage, `ppms-${key}`, value)
     window.dispatchEvent(new Event(`ppms-${key}-updated`))
-    if (remoteToken) apiRequest(`/api/state/${key}`, { method: 'PUT', body: JSON.stringify({ value }) }).catch(() => undefined)
-  }, [key, remoteReady, remoteToken, value])
+    if (remoteToken) {
+      saveQueue.current = saveQueue.current.then(async () => {
+        const payload = await apiRequest<{ version: number }>(`/api/state/${key}`, { method: 'PUT', body: JSON.stringify({ value, version: version.current }) })
+        version.current = payload.version
+      }).catch((error: Error) => {
+        window.dispatchEvent(new CustomEvent('ppms-request-error', { detail: error.message }))
+      })
+    }
+  }, [canRead, key, remoteReady, remoteToken, value])
   return [value, setValue] as const
 }
 
@@ -555,7 +586,16 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    if (!authUser || !localStorage.getItem('ppms-session-token')) return
+    const handleRequestError = (event: Event) => {
+      const detail = (event as CustomEvent<string>).detail
+      if (detail) setNotice(detail)
+    }
+    window.addEventListener('ppms-request-error', handleRequestError)
+    return () => window.removeEventListener('ppms-request-error', handleRequestError)
+  }, [])
+
+  useEffect(() => {
+    if (!authUser || authUser.role === 'operator' || !localStorage.getItem('ppms-session-token')) return
     const loadBackups = () => apiRequest<{ backups: BackupInfo[] }>('/api/system/backups').then((payload) => setBackups(payload.backups)).catch((error: Error) => flash(error.message))
     const loadSystem = () => {
       apiRequest<SystemStatus>('/api/system/status').then(setSystemStatus).catch(() => undefined)
@@ -629,6 +669,7 @@ export default function App() {
   const go = (tab: string) => { setSelectedTab(tab); setNotice(''); setMobileMenuOpen(false) }
   const customerName = (id: number) => customers.find((customer) => customer.id === id)?.name || 'Unknown customer'
   const downloadBackup = () => {
+    if (authUser?.role !== 'admin') return flash('Administrator role required to download a complete register backup.')
     const blob = new Blob([createBackup(localStorage, STORAGE_KEYS)], { type: 'application/json' })
     const url = URL.createObjectURL(blob)
     const link = document.createElement('a')
@@ -640,40 +681,47 @@ export default function App() {
   }
   const uploadBackup = (file: File) => {
     file.text().then(async (backup) => {
-      restoreBackup(localStorage, backup, STORAGE_KEYS)
+      const registerData = parseBackup(backup, STORAGE_KEYS.map((key) => key.slice('ppms-'.length)))
       const token = localStorage.getItem('ppms-session-token')
       if (token) {
-        await Promise.all(STORAGE_KEYS.map((storageKey) => {
-          const key = storageKey.slice('ppms-'.length)
-          const value = readStored<unknown>(localStorage, storageKey, null)
-          return apiRequest(`/api/state/${key}`, { method: 'PUT', body: JSON.stringify({ value }) })
-        }))
+        await apiRequest('/api/system/restore-registers', { method: 'POST', body: JSON.stringify({ backup }) })
+        for (const [key, value] of Object.entries(registerData)) writeStored(localStorage, `ppms-${key}`, value)
+        window.location.reload()
+        return
       }
+      restoreBackup(localStorage, backup, STORAGE_KEYS)
       flash('Register backup restored successfully.')
       window.setTimeout(() => window.location.reload(), 400)
     }).catch((error: Error) => flash(error.message || 'Backup restore failed. Select a valid PPMS backup file.'))
   }
-  const resetRegisterData = () => {
-    if (!window.confirm('Reset all register data to empty? User accounts will be kept.')) return
-    setMeters([])
-    setMeterTests([])
-    setSales([])
-    setCustomers([])
-    setUdhar([])
-    setExpenses([])
-    setPurchases([])
-    setOilSales([])
-    setCommissionRecords([])
-    setDiscountRules([])
-    setPaymentFees([])
-    setStockAdjustments([])
-    setBankAccounts([])
-    setBrsRecords([])
-    setFamilyAdjustments([])
-    setEmployeeSalaries([])
-    setStockOpenings({ HSD: 0, PMG: 0, XTRON: 0 })
-    setStatementCustomerId(0)
-    flash('All register data was reset. User accounts were kept.')
+  const resetRegisterData = async () => {
+    if (!window.confirm('This permanently clears all business register data while keeping user accounts. A verified safety backup will be created first.')) return
+    if (window.prompt('Type RESET ALL REGISTER DATA to confirm:') !== 'RESET ALL REGISTER DATA') return
+    try {
+      const result = await apiRequest<{ safetyBackup: string }>('/api/system/reset-registers', { method: 'POST', body: JSON.stringify({ confirmation: 'RESET ALL REGISTER DATA' }) })
+      flash(`Register data reset. Safety backup: ${result.safetyBackup}`)
+      window.setTimeout(() => window.location.reload(), 500)
+    } catch (error) {
+      flash((error as Error).message)
+    }
+  }
+  const deleteSale = async (sale: Sale) => {
+    if (!window.confirm(`Delete the ${sale.product} sale from ${displayDate(sale.date)} for ${printMoney(sale.amount)}? This cannot be undone.`)) return
+    try {
+      await apiRequest(`/api/sales/${encodeURIComponent(String(sale.id))}`, { method: 'DELETE' })
+      window.location.reload()
+    } catch (error) {
+      flash((error as Error).message)
+    }
+  }
+  const deleteCustomer = async (customer: Customer) => {
+    if (!window.confirm(`Delete customer ${customer.name}? Customers with outstanding balances or linked history cannot be deleted.`)) return
+    try {
+      await apiRequest(`/api/customers/${encodeURIComponent(String(customer.id))}`, { method: 'DELETE' })
+      window.location.reload()
+    } catch (error) {
+      flash((error as Error).message)
+    }
   }
   const login = (username: string, password: string) => {
     apiRequest<{ token: string; user: SessionUser }>('/api/auth/login', { method: 'POST', body: JSON.stringify({ username, password }) }).then((payload) => {
@@ -1747,8 +1795,8 @@ export default function App() {
       </form>
       <FormPanel title="Discount Rule Setup" onSubmit={saveDiscountRule} submitLabel="Save Discount"><Field label="Customer" name="customerId" options={customers.map((customer) => `${customer.id} - ${customer.name}`)} required={false} /><Field label="Product" name="product" options={['', 'HSD', 'PMG', 'XTRON']} required={false} /><Field label="Discount Type" name="discountType" options={['percent', 'fixed']} defaultValue="percent" /><Field label="Discount Value" name="discountValue" type="number" defaultValue={2} /><Field label="Effective Date" name="effectiveDate" type="date" defaultValue={today} /><Field label="Status" name="status" options={['Active', 'Inactive']} defaultValue="Active" /><Field label="Description" name="description" defaultValue="Customer discount" /></FormPanel>
       <section className="register-section"><div className="section-heading"><h3>Customer Discount Rules</h3></div><DataTable headers={['Customer', 'Product', 'Type', 'Value', 'Status', 'Description']} rows={discountRules.map((rule) => [rule.customerId ? customerName(rule.customerId) : 'General', rule.product || 'All', rule.discountType, rule.discountValue.toString(), rule.status, rule.description])} /></section>
-      <section className="register-section"><div className="section-heading"><h3>Customer Register</h3></div><DataTable headers={['Name', 'Phone', 'Address', 'Opening Balance']} rows={customers.map((customer) => [customer.name, customer.phone, customer.address, money(customer.openingBalance)])} actions={(rowIndex) => <button className="table-action" type="button" onClick={() => { const customer = customers[rowIndex]; setCustomers((current) => current.filter((item) => item.id !== customer.id)); setUdhar((current) => current.filter((item) => item.customerId !== customer.id)); setDiscountRules((current) => current.filter((rule) => rule.customerId !== customer.id)); setFamilyAdjustments((current) => current.filter((entry) => entry.customerId !== customer.id)); if (statementCustomerId === customer.id) setStatementCustomerId(0); flash('Customer and linked transactions deleted.') }}>Delete</button>} /></section><section className="register-section"><div className="section-heading"><h3>Customer Statement by Date</h3></div><div className="statement-controls"><label className="form-field"><span>Customer</span><select value={statementCustomerId} onChange={(event) => setStatementCustomerId(Number(event.target.value))}>{customers.map((customer) => <option key={customer.id} value={customer.id}>{customer.name}</option>)}</select></label><label className="form-field"><span>As of</span><input type="date" value={statementDate} onChange={(event) => setStatementDate(event.target.value)} /></label></div><DataTable headers={['Date', 'Type', 'Reference', 'Debit', 'Credit', 'Description']} rows={statementEntries.map((item) => [item.date, item.type, item.reference, money(item.debit), money(item.credit), item.description])} /><div className="summary-strip"><strong>Balance: {money(statementBalance)}</strong></div></section>
-      <section className="register-section"><div className="section-heading"><h3>Customer Register</h3></div><DataTable headers={['Name', 'Phone', 'Address', 'Opening Balance', 'Outstanding']} rows={customers.map((customer) => [customer.name, customer.phone, customer.address, money(customer.openingBalance), money(customerBalance(customer.id, customers, udhar))])} actions={(rowIndex) => <button className="table-action" type="button" onClick={() => { const customer = customers[rowIndex]; setCustomers((current) => current.filter((item) => item.id !== customer.id)); setUdhar((current) => current.filter((item) => item.customerId !== customer.id)); setDiscountRules((current) => current.filter((rule) => rule.customerId !== customer.id)); setFamilyAdjustments((current) => current.filter((entry) => entry.customerId !== customer.id)); if (statementCustomerId === customer.id) setStatementCustomerId(0); flash('Customer and linked transactions deleted.') }}>Delete</button>} /></section>
+      <section className="register-section"><div className="section-heading"><h3>Customer Register</h3></div><DataTable headers={['Name', 'Phone', 'Address', 'Opening Balance']} rows={customers.map((customer) => [customer.name, customer.phone, customer.address, money(customer.openingBalance)])} actions={authUser?.role === 'operator' ? undefined : (rowIndex) => <button className="table-action" type="button" onClick={() => deleteCustomer(customers[rowIndex])}>Delete</button>} /></section><section className="register-section"><div className="section-heading"><h3>Customer Statement by Date</h3></div><div className="statement-controls"><label className="form-field"><span>Customer</span><select value={statementCustomerId} onChange={(event) => setStatementCustomerId(Number(event.target.value))}>{customers.map((customer) => <option key={customer.id} value={customer.id}>{customer.name}</option>)}</select></label><label className="form-field"><span>As of</span><input type="date" value={statementDate} onChange={(event) => setStatementDate(event.target.value)} /></label></div><DataTable headers={['Date', 'Type', 'Reference', 'Debit', 'Credit', 'Description']} rows={statementEntries.map((item) => [item.date, item.type, item.reference, money(item.debit), money(item.credit), item.description])} /><div className="summary-strip"><strong>Balance: {money(statementBalance)}</strong></div></section>
+      <section className="register-section"><div className="section-heading"><h3>Customer Register</h3></div><DataTable headers={['Name', 'Phone', 'Address', 'Opening Balance', 'Outstanding']} rows={customers.map((customer) => [customer.name, customer.phone, customer.address, money(customer.openingBalance), money(customerBalance(customer.id, customers, udhar))])} actions={authUser?.role === 'operator' ? undefined : (rowIndex) => <button className="table-action" type="button" onClick={() => deleteCustomer(customers[rowIndex])}>Delete</button>} /></section>
       <section className="register-section"><div className="section-heading"><h3>Customer Transaction History</h3></div><div className="statement-controls"><label className="form-field"><span>Customer</span><select value={statementCustomerId} onChange={(event) => setStatementCustomerId(Number(event.target.value))}><option value="0">Select customer</option>{customers.map((customer) => <option key={customer.id} value={customer.id}>{customer.name}</option>)}</select></label><label className="form-field"><span>As of</span><input type="date" value={statementDate} onChange={(event) => setStatementDate(event.target.value)} /></label></div>{statementCustomerId > 0 && <div className="summary-strip"><strong>Total Udhar: {money(selectedCustomerEntries.reduce((sum, item) => sum + item.debit, 0))}</strong><strong>Total Paid: {money(selectedCustomerEntries.filter((item) => item.type === 'Payment Received').reduce((sum, item) => sum + item.credit, 0))}</strong><strong>Remaining: {money(customerOutstanding(statementCustomerId))}</strong></div>}<DataTable headers={['Date', 'Type', 'Description', 'Payment Method', 'Debit', 'Credit', 'Balance', 'Action']} rows={selectedCustomerHistory.map(({ entry, balance }) => [entry.date, entry.type, entry.description, entry.paymentMethod || '-', money(entry.debit), money(entry.credit), money(balance), ''])} actions={(rowIndex) => { const item = selectedCustomerHistory[rowIndex]?.entry; return item?.type === 'Payment Received' ? <><button className="table-action" type="button" onClick={() => editCustomerPayment(item)}>Edit</button><button className="table-action danger-link" type="button" onClick={() => deleteCustomerPayment(item)}>Delete</button></> : undefined }} /></section>
     </>
   )
@@ -1805,8 +1853,8 @@ export default function App() {
       <section className="register-section"><div className="section-heading"><h3>Monthly Statement Overview</h3></div><DataTable headers={['Ledger', 'Total', 'Notes']} rows={[['Fuel Sales', money(filteredSales.reduce((sum, sale) => sum + sale.amount, 0)), 'Gross fuel revenue'], ['Fuel Purchases', money(filteredPurchases.reduce((sum, purchase) => sum + purchase.amount, 0)), 'Stock procurement'], ['Customer Payments', money(filteredUdhar.filter((item) => item.type === 'Payment Received').reduce((sum, item) => sum + item.credit, 0)), 'Receipts'], ['Expenses', money(filteredExpenses.reduce((sum, expense) => sum + expense.amount, 0)), 'Operating costs'], ['Commission', money(commissionAmountForRange), 'Recorded commission expense'], ['Customers Receivable', money(customers.reduce((sum, customer) => sum + customerBalance(customer.id, customers, udhar), 0)), 'Current outstanding']]} /></section>
       <section className="register-section"><div className="section-heading"><h3>Meter Reading Report</h3></div><DataTable headers={['Date', 'Shift', 'Nozzle', 'Fuel', 'Opening', 'Closing', 'Litres Sold', 'Rate', 'Amount']} rows={filteredMeters.map((meter) => [meter.date, meter.shift, meter.nozzle, meter.product, measurement(meter.previous), measurement(meter.present), measurement(meter.litres), meter.rate === undefined ? '-' : printMoney(meter.rate), meter.amount === undefined ? '-' : printMoney(meter.amount)])} /></section>
       <section className="register-section"><div className="section-heading"><h3>BRS Detail</h3></div><DataTable headers={['Date', 'Description', 'Type', 'Amount', 'Status']} rows={brsRecords.filter((entry) => entry.date >= reportRange.from && entry.date <= reportRange.to).map((entry) => [entry.date, entry.description, entry.type, money(entry.amount), entry.status])} /></section>
-      <FormPanel title="Employee Salary Register" onSubmit={saveEmployeeSalary} submitLabel="Save Salary"><Field label="Payment Date" name="date" type="date" defaultValue={today} /><Field label="Salary Period" name="period" defaultValue={today.slice(0, 7)} /><Field label="Employee Name" name="employee" /><Field label="Gross Salary" name="gross" type="number" defaultValue={0} /><Field label="Deductions / Advance" name="deductions" type="number" defaultValue={0} /><Field label="Paid By" name="paidBy" options={['Cash', 'Bank', 'Card']} defaultValue="Cash" /><Field label="Status" name="status" options={['Paid', 'Pending']} defaultValue="Paid" /><Field label="Notes" name="notes" required={false} /></FormPanel>
-      <section className="register-section"><div className="section-heading"><h3>Employee Salary History</h3></div><DataTable headers={['Date', 'Period', 'Employee', 'Gross', 'Deductions', 'Net Paid', 'Paid By', 'Status']} rows={employeeSalaries.filter((salary) => salary.date >= reportRange.from && salary.date <= reportRange.to).map((salary) => [salary.date, salary.period, salary.employee, money(salary.gross), money(salary.deductions), money(salary.net), salary.paidBy, salary.status])} actions={(rowIndex) => <button className="table-action" type="button" onClick={() => { const visibleSalaries = employeeSalaries.filter((salary) => salary.date >= reportRange.from && salary.date <= reportRange.to); setEmployeeSalaries((current) => current.filter((salary) => salary.id !== visibleSalaries[rowIndex].id)) }}>Delete</button>} /></section>
+      {authUser?.role === 'admin' && <><FormPanel title="Employee Salary Register" onSubmit={saveEmployeeSalary} submitLabel="Save Salary"><Field label="Payment Date" name="date" type="date" defaultValue={today} /><Field label="Salary Period" name="period" defaultValue={today.slice(0, 7)} /><Field label="Employee Name" name="employee" /><Field label="Gross Salary" name="gross" type="number" defaultValue={0} /><Field label="Deductions / Advance" name="deductions" type="number" defaultValue={0} /><Field label="Paid By" name="paidBy" options={['Cash', 'Bank', 'Card']} defaultValue="Cash" /><Field label="Status" name="status" options={['Paid', 'Pending']} defaultValue="Paid" /><Field label="Notes" name="notes" required={false} /></FormPanel>
+      <section className="register-section"><div className="section-heading"><h3>Employee Salary History</h3></div><DataTable headers={['Date', 'Period', 'Employee', 'Gross', 'Deductions', 'Net Paid', 'Paid By', 'Status']} rows={employeeSalaries.filter((salary) => salary.date >= reportRange.from && salary.date <= reportRange.to).map((salary) => [salary.date, salary.period, salary.employee, money(salary.gross), money(salary.deductions), money(salary.net), salary.paidBy, salary.status])} actions={(rowIndex) => <button className="table-action" type="button" onClick={() => { const visibleSalaries = employeeSalaries.filter((salary) => salary.date >= reportRange.from && salary.date <= reportRange.to); setEmployeeSalaries((current) => current.filter((salary) => salary.id !== visibleSalaries[rowIndex].id)) }}>Delete</button>} /></section></>}
       <FormPanel title="Family Adjustment" onSubmit={saveFamilyAdjustment} submitLabel="Save Adjustment"><Field label="Date" name="date" type="date" defaultValue={today} /><Field label="Customer / Family Account" name="customerId" options={customers.map((customer) => `${customer.id} - ${customer.name}`)} required={false} /><Field label="Amount" name="amount" type="number" defaultValue={0} /><Field label="Adjustment Type" name="adjustmentType" options={['Increase', 'Decrease']} defaultValue="Increase" /><Field label="Status" name="status" options={['Active', 'Inactive']} defaultValue="Active" /><Field label="Description" name="description" defaultValue="Family adjustment" /><Field label="Notes" name="notes" defaultValue="Adjustment note" /></FormPanel><section className="register-section"><div className="section-heading"><h3>Family Adjustment Register</h3></div><DataTable headers={['Date', 'Customer', 'Amount', 'Type', 'Status', 'Description']} rows={familyAdjustments.filter((entry) => entry.date >= reportRange.from && entry.date <= reportRange.to).map((entry) => [entry.date, entry.customerId ? customerName(entry.customerId) : 'General', money(entry.amount), entry.adjustmentType, entry.status, entry.description])} actions={(rowIndex) => <button className="table-action" type="button" onClick={() => setFamilyAdjustments((current) => current.filter((entry) => entry.id !== familyAdjustments.filter((item) => item.date >= reportRange.from && item.date <= reportRange.to)[rowIndex].id))}>Delete</button>} /></section>
     </>
   )
@@ -1816,7 +1864,7 @@ export default function App() {
     selectedTab === 'Customers' ? customerPage :
     selectedTab === 'Settings' ? settingsPage :
     selectedTab === 'Reports' ? reportCenterPage :
-    selectedTab === 'Accounting' ? reportsPage :
+    selectedTab === 'Accounting' ? (authUser?.role === 'operator' ? <section className="register-section"><h3>Restricted</h3><p>Accounting data is available to managers and administrators.</p></section> : reportsPage) :
     selectedTab === 'Meter Reading' ? (
       <>
         <section className="register-section meter-print-register">
@@ -1865,7 +1913,7 @@ export default function App() {
     selectedTab === 'Sales' ? (
       <>
         <FormPanel title="Fuel Sale / Daily Sales Register" onSubmit={saveSale}><Field label="Date" name="date" type="date" defaultValue={today} /><Field label="Product" name="product" options={products} defaultValue="HSD" /><Field label="Litres" name="litres" type="number" defaultValue={100} /><Field label="Sale Rate" name="rate" type="number" defaultValue={285} /><Field label="Payment Mode" name="mode" options={['Cash', 'Credit', 'Bank']} defaultValue="Cash" /><Field label="Payment Method" name="paymentMethod" options={['Cash', 'Card', 'Credit Card', 'Debit Card', 'Bank Transfer', 'Online Payment', 'Other']} defaultValue="Cash" /><Field label="Customer for Credit Sale" name="customerId" options={customers.map((customer) => `${customer.id} - ${customer.name}`)} required={false} /></FormPanel>
-        <section className="register-section"><div className="section-heading"><h3>Fuel Sales Register</h3><input className="table-search" aria-label="Search fuel sales" value={recordSearch} onChange={(event) => setRecordSearch(event.target.value)} placeholder="Search sales" /></div><DataTable headers={['Date', 'Product', 'Litres', 'Rate', 'Amount', 'Mode', 'Customer']} rows={visibleSales.map((sale) => [sale.date, sale.product, sale.litres, money(sale.rate), money(sale.amount), sale.mode, sale.customer])} actions={(rowIndex) => <button className="table-action" type="button" onClick={() => setSales((current) => current.filter((sale) => sale.id !== visibleSales[rowIndex].id))}>Delete</button>} /></section>
+        <section className="register-section"><div className="section-heading"><h3>Fuel Sales Register</h3><input className="table-search" aria-label="Search fuel sales" value={recordSearch} onChange={(event) => setRecordSearch(event.target.value)} placeholder="Search sales" /></div><DataTable headers={['Date', 'Product', 'Litres', 'Rate', 'Amount', 'Mode', 'Customer']} rows={visibleSales.map((sale) => [sale.date, sale.product, sale.litres, money(sale.rate), money(sale.amount), sale.mode, sale.customer])} actions={authUser?.role === 'operator' ? undefined : (rowIndex) => <button className="table-action" type="button" onClick={() => deleteSale(visibleSales[rowIndex])}>Delete</button>} /></section>
       </>
     ) :
     selectedTab === 'Expenses' ? (
@@ -1977,7 +2025,7 @@ export default function App() {
           <div className="brand"><span className="brand-mark">P</span><div><strong>PPMS</strong><small>EKHWAN - 1 Filling Station</small></div></div>
           <nav className="nav" aria-label="PPMS modules">
             {navigationGroups.map((group) => {
-              const visibleTabs = group.tabs.filter((tab) => tab !== 'Settings' || authUser.role !== 'operator')
+              const visibleTabs = group.tabs.filter((tab) => (tab !== 'Settings' && tab !== 'Accounting') || authUser.role !== 'operator')
               if (!visibleTabs.length) return null
               return <div className="nav-section" key={group.label}><h3>{group.label}</h3>{visibleTabs.map((tab) => <button key={tab} type="button" className={`nav-item${selectedTab === tab ? ' active' : ''}`} aria-current={selectedTab === tab ? 'page' : undefined} onClick={() => go(tab)}><span className="nav-indicator" aria-hidden="true" />{tab}</button>)}</div>
             })}

@@ -21,7 +21,9 @@ const monthlyBackupDir = join(backupDir, 'Monthly')
 const safetyBackupDir = join(backupDir, 'Safety')
 const adminPassword = process.env.PPMS_ADMIN_PASSWORD
 const legacyDatabasePaths = String(process.env.PPMS_LEGACY_DB_PATHS || '').split(process.platform === 'win32' ? ';' : ':').filter(Boolean)
-const allowedKeys = new Set(['meters', 'meter-calibrations', 'sales', 'customers', 'udhar-transactions', 'expenses', 'employee-salaries', 'purchases', 'oil-sales', 'commission-records', 'discount-rules', 'payment-fees', 'stock-adjustments', 'stock-openings', 'bank-accounts', 'brs-records', 'family-adjustments'])
+const allowedKeys = new Set(['meters', 'meter-calibrations', 'sales', 'customers', 'udhar-transactions', 'expenses', 'employee-salaries', 'purchases', 'oil-sales', 'commission-records', 'discount-rules', 'payment-fees', 'stock-adjustments', 'stock-openings', 'bank-accounts', 'brs-records', 'family-adjustments', 'fleet-vehicles', 'fleet-allocations'])
+const managerAdminKeys = new Set(['commission-records', 'discount-rules', 'payment-fees', 'bank-accounts', 'brs-records', 'family-adjustments', 'stock-openings'])
+const adminOnlyKeys = new Set(['employee-salaries'])
 const sessions = new Map()
 const requiredTables = ['users', 'register_state', 'audit_log']
 
@@ -96,7 +98,8 @@ try {
       key TEXT PRIMARY KEY,
       value_json TEXT NOT NULL,
       updated_at TEXT NOT NULL,
-      updated_by TEXT NOT NULL
+      updated_by TEXT NOT NULL,
+      version INTEGER NOT NULL DEFAULT 1
     );
     CREATE TABLE IF NOT EXISTS audit_log (
       id TEXT PRIMARY KEY,
@@ -106,6 +109,10 @@ try {
       created_at TEXT NOT NULL
     );
   `)
+  const registerColumns = db.prepare('PRAGMA table_info(register_state)').all()
+  if (!registerColumns.some((column) => column.name === 'version')) {
+    db.exec('ALTER TABLE register_state ADD COLUMN version INTEGER NOT NULL DEFAULT 1')
+  }
   const integrity = db.prepare('PRAGMA quick_check').get()?.quick_check
   if (integrity !== 'ok') throw new Error('SQLite quick_check failed.')
 } catch (error) {
@@ -171,7 +178,7 @@ function backupFiles() {
     if (!existsSync(location)) continue
     for (const name of readdirSync(location)) {
       const filePath = join(location, name)
-      if (!statSync(filePath).isFile() || !/^PPMS_(Daily_Backup|Monthly_Backup|PreRestore)_/i.test(name) && !name.endsWith('.sqlite')) continue
+      if (!statSync(filePath).isFile() || !/^PPMS_(Daily_Backup|Monthly_Backup|PreRestore|PreReset|PreRegisterRestore)_/i.test(name) && !name.endsWith('.sqlite')) continue
       const stats = statSync(filePath)
       files.push({ name, path: filePath, type: backupType(name, filePath), createdAt: stats.birthtime.toISOString(), modifiedAt: stats.mtime.toISOString(), size: stats.size })
     }
@@ -211,6 +218,139 @@ function copyVerifiedBackup(destination, replace = false) {
 function requireBackupRole(user, destructive = false) {
   if (user.role === 'operator' || destructive && user.role !== 'admin') return false
   return true
+}
+
+function roleCanAccessKey(user, key, operation) {
+  if (adminOnlyKeys.has(key)) return user.role === 'admin'
+  if (managerAdminKeys.has(key)) return user.role === 'admin' || user.role === 'manager'
+  return operation === 'delete'
+    ? user.role === 'admin' || user.role === 'manager'
+    : ['admin', 'manager', 'operator'].includes(user.role)
+}
+
+function storedValue(key) {
+  const row = db.prepare('SELECT value_json, version FROM register_state WHERE key = ?').get(key)
+  return row ? { value: JSON.parse(row.value_json), version: row.version, exists: true } : { value: null, version: 0, exists: false }
+}
+
+function identityOf(value) {
+  if (value && typeof value === 'object' && 'id' in value) return `id:${String(value.id)}`
+  return `value:${JSON.stringify(value)}`
+}
+
+function removesRecords(previous, next) {
+  if (!Array.isArray(previous) || !Array.isArray(next)) return false
+  const nextIds = new Set(next.map(identityOf))
+  return previous.some((item) => !nextIds.has(identityOf(item)))
+}
+
+function writeRegister(user, key, value, expectedVersion) {
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    const current = storedValue(key)
+    if (!Number.isInteger(expectedVersion) || expectedVersion !== current.version) {
+      db.exec('ROLLBACK')
+      return { conflict: true, ...current }
+    }
+    if (removesRecords(current.value, value)) {
+      if (key === 'sales' || key === 'customers') {
+        db.exec('ROLLBACK')
+        return { guardedDelete: true }
+      }
+      if (!roleCanAccessKey(user, key, 'delete')) {
+        db.exec('ROLLBACK')
+        return { forbidden: true }
+      }
+    }
+    const version = current.version + 1
+    db.prepare(`INSERT INTO register_state (key, value_json, updated_at, updated_by, version)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at,
+      updated_by = excluded.updated_by, version = excluded.version`).run(key, JSON.stringify(value), new Date().toISOString(), user.id, version)
+    audit(user, 'write', key)
+    db.exec('COMMIT')
+    return { version }
+  } catch (error) {
+    try { db.exec('ROLLBACK') } catch { /* Preserve the original write error. */ }
+    throw error
+  }
+}
+
+function writeRegisterValues(user, values, clearUnknownKeys = false) {
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    if (clearUnknownKeys) {
+      const resetKeys = new Set(Object.keys(values))
+      const registerKeys = db.prepare('SELECT key FROM register_state').all()
+      for (const { key } of registerKeys) {
+        if (resetKeys.has(key)) continue
+        const version = storedValue(key).version + 1
+        db.prepare('UPDATE register_state SET value_json = ?, updated_at = ?, updated_by = ?, version = ? WHERE key = ?')
+          .run(JSON.stringify([]), new Date().toISOString(), user.id, version, key)
+        audit(user, 'write', key)
+      }
+    }
+    for (const [key, value] of Object.entries(values)) {
+      const current = storedValue(key)
+      const version = current.version + 1
+      db.prepare(`INSERT INTO register_state (key, value_json, updated_at, updated_by, version)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at,
+        updated_by = excluded.updated_by, version = excluded.version`).run(key, JSON.stringify(value), new Date().toISOString(), user.id, version)
+      audit(user, 'write', key)
+    }
+    db.exec('COMMIT')
+  } catch (error) {
+    try { db.exec('ROLLBACK') } catch { /* Preserve the original write error. */ }
+    throw error
+  }
+}
+
+function advanceVersionsAfterRestore(user, previousVersions) {
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    for (const key of allowedKeys) {
+      const restored = storedValue(key)
+      const version = Math.max(previousVersions.get(key) || 0, restored.version) + 1
+      if (!restored.exists) {
+        db.prepare('INSERT INTO register_state (key, value_json, updated_at, updated_by, version) VALUES (?, ?, ?, ?, ?)')
+          .run(key, JSON.stringify(null), new Date().toISOString(), user.id, version)
+      } else {
+        db.prepare('UPDATE register_state SET updated_at = ?, updated_by = ?, version = ? WHERE key = ?')
+          .run(new Date().toISOString(), user.id, version, key)
+      }
+    }
+    audit(user, 'restore-versions-advanced', 'register_state')
+    db.exec('COMMIT')
+  } catch (error) {
+    try { db.exec('ROLLBACK') } catch { /* Preserve the original version migration error. */ }
+    throw error
+  }
+}
+
+function deleteRegisterRecord(user, key, id) {
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    const current = storedValue(key)
+    if (!Array.isArray(current.value)) {
+      db.exec('ROLLBACK')
+      return { missing: true }
+    }
+    const updated = current.value.filter((item) => String(item?.id) !== String(id))
+    if (updated.length === current.value.length) {
+      db.exec('ROLLBACK')
+      return { missing: true }
+    }
+    const version = current.version + 1
+    db.prepare(`UPDATE register_state SET value_json = ?, updated_at = ?, updated_by = ?, version = ? WHERE key = ?`)
+      .run(JSON.stringify(updated), new Date().toISOString(), user.id, version, key)
+    audit(user, 'delete', `${key}:${id}`)
+    db.exec('COMMIT')
+    return { version }
+  } catch (error) {
+    try { db.exec('ROLLBACK') } catch { /* Preserve the original delete error. */ }
+    throw error
+  }
 }
 
 function safeBackupEntry(name) {
@@ -297,10 +437,12 @@ const server = createServer(async (request, response) => {
     }
 
     if (request.method === 'GET' && url.pathname === '/api/system/status') {
+      if (!requireBackupRole(user)) return send(request, response, 403, { error: 'Manager or administrator role required.' })
       return send(request, response, 200, { version: process.env.PPMS_VERSION || '0.0.0', databasePath: dbPath, backupDir, databaseExists: existsSync(dbPath) })
     }
 
     if (request.method === 'GET' && url.pathname === '/api/system/backups') {
+      if (!requireBackupRole(user)) return send(request, response, 403, { error: 'Manager or administrator role required.' })
       return send(request, response, 200, { backups: backupFiles().map(({ path, ...entry }) => entry), backupDir, dailyBackupDir, monthlyBackupDir, safetyBackupDir })
     }
 
@@ -346,43 +488,144 @@ const server = createServer(async (request, response) => {
       const input = await body(request)
       const entry = safeBackupEntry(input.name)
       if (!entry) return send(request, response, 404, { error: 'Backup file not found.' })
+      const previousVersions = new Map([...allowedKeys].map((key) => [key, storedValue(key).version]))
       const safetyName = `PPMS_PreRestore_${new Date().toISOString().slice(0, 19).replace('T', '_').replaceAll(':', '-')}.db`
       const safetyPath = join(safetyBackupDir, safetyName)
+      let safetyBackupCreated = false
       try {
         verifyDatabase(entry.path)
         copyVerifiedBackup(safetyPath)
+        safetyBackupCreated = true
         db.close()
         db = null
         copyFileSync(entry.path, dbPath)
         db = new DatabaseSync(dbPath)
+        if (!db.prepare('PRAGMA table_info(register_state)').all().some((column) => column.name === 'version')) {
+          db.exec('ALTER TABLE register_state ADD COLUMN version INTEGER NOT NULL DEFAULT 1')
+        }
+        advanceVersionsAfterRestore(user, previousVersions)
         verifyDatabase(dbPath)
         audit(user, 'backup-restored', entry.name)
         return send(request, response, 200, { ok: true, restored: entry.name, safetyBackup: safetyName, restartRequired: true })
       } catch (error) {
-        try {
-          if (db) db.close()
-        } catch { /* Continue with the safety restore attempt. */ }
-        try {
-          if (existsSync(safetyPath)) copyFileSync(safetyPath, dbPath)
-          db = new DatabaseSync(dbPath)
-        } catch { /* Preserve the original restore error for the caller. */ }
+        if (safetyBackupCreated) {
+          try { db?.close() } catch { /* Continue with the safety restore attempt. */ }
+          db = null
+          try {
+            copyFileSync(safetyPath, dbPath)
+            db = new DatabaseSync(dbPath)
+            if (!db.prepare('PRAGMA table_info(register_state)').all().some((column) => column.name === 'version')) {
+              db.exec('ALTER TABLE register_state ADD COLUMN version INTEGER NOT NULL DEFAULT 1')
+            }
+            verifyDatabase(dbPath)
+          } catch (recoveryError) {
+            writeLog('ERROR', `Restore recovery from ${safetyPath} failed: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`)
+            return send(request, response, 500, { error: `Restore failed and automatic recovery from the safety backup also failed. Safety backup: ${safetyName}.` })
+          }
+        }
         return send(request, response, 500, { error: error instanceof Error ? error.message : 'Unable to restore backup. The current database was preserved with a safety backup.' })
       }
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/system/reset-registers') {
+      if (user.role !== 'admin') return send(request, response, 403, { error: 'Administrator role required.' })
+      const input = await body(request)
+      if (input.confirmation !== 'RESET ALL REGISTER DATA') return send(request, response, 400, { error: 'Type RESET ALL REGISTER DATA to confirm this destructive action.' })
+      const safetyName = `PPMS_PreReset_${new Date().toISOString().slice(0, 19).replace('T', '_').replaceAll(':', '-')}.db`
+      const safetyPath = join(safetyBackupDir, safetyName)
+      try {
+        copyVerifiedBackup(safetyPath)
+        const resetValues = Object.fromEntries([...allowedKeys].map((key) => [key, key === 'stock-openings' ? { HSD: 0, PMG: 0, XTRON: 0 } : []]))
+        writeRegisterValues(user, resetValues, true)
+        return send(request, response, 200, { ok: true, safetyBackup: safetyName })
+      } catch (error) {
+        writeLog('ERROR', `Register reset failed: ${error instanceof Error ? error.message : String(error)}`)
+        return send(request, response, 500, { error: error instanceof Error ? error.message : 'Unable to reset register data. No reset was reported as successful.' })
+      }
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/system/restore-registers') {
+      if (user.role !== 'admin') return send(request, response, 403, { error: 'Administrator role required.' })
+      const input = await body(request)
+      let parsedBackup
+      try { parsedBackup = JSON.parse(String(input.backup || '')) } catch {
+        return send(request, response, 400, { error: 'Invalid PPMS register backup file.' })
+      }
+      if (!parsedBackup || typeof parsedBackup !== 'object' || typeof parsedBackup.version !== 'number' ||
+        typeof parsedBackup.createdAt !== 'string' || !parsedBackup.data || typeof parsedBackup.data !== 'object' || Array.isArray(parsedBackup.data)) {
+        return send(request, response, 400, { error: 'Register backup data is invalid.' })
+      }
+      const values = Object.entries(parsedBackup.data).filter(([key]) => allowedKeys.has(key))
+      const safetyName = `PPMS_PreRegisterRestore_${new Date().toISOString().slice(0, 19).replace('T', '_').replaceAll(':', '-')}.db`
+      const safetyPath = join(safetyBackupDir, safetyName)
+      try {
+        copyVerifiedBackup(safetyPath)
+        if (values.length) writeRegisterValues(user, Object.fromEntries(values))
+        return send(request, response, 200, { ok: true, safetyBackup: safetyName })
+      } catch (error) {
+        writeLog('ERROR', `Register backup restore failed: ${error instanceof Error ? error.message : String(error)}`)
+        return send(request, response, 500, { error: error instanceof Error ? error.message : 'Unable to restore register backup. The current data was preserved.' })
+      }
+    }
+
+    if (request.method === 'DELETE' && url.pathname.startsWith('/api/sales/')) {
+      if (!requireBackupRole(user)) return send(request, response, 403, { error: 'Manager or administrator role required.' })
+      const id = decodeURIComponent(url.pathname.slice('/api/sales/'.length))
+      const sales = storedValue('sales').value
+      if (!Array.isArray(sales) || !sales.some((sale) => String(sale?.id) === id)) return send(request, response, 404, { error: 'Sale not found.' })
+      const linkedTransactions = storedValue('udhar-transactions').value
+      if (Array.isArray(linkedTransactions) && linkedTransactions.some((entry) => String(entry?.id) === id)) {
+        return send(request, response, 409, { error: 'This sale has linked customer financial history and cannot be deleted.' })
+      }
+      const result = deleteRegisterRecord(user, 'sales', id)
+      if (result.missing) return send(request, response, 404, { error: 'Sale not found.' })
+      return send(request, response, 200, { ok: true, version: result.version })
+    }
+
+    if (request.method === 'DELETE' && url.pathname.startsWith('/api/customers/')) {
+      if (!requireBackupRole(user)) return send(request, response, 403, { error: 'Manager or administrator role required.' })
+      const id = decodeURIComponent(url.pathname.slice('/api/customers/'.length))
+      const customers = storedValue('customers').value
+      const customer = Array.isArray(customers) ? customers.find((entry) => String(entry?.id) === id) : null
+      if (!customer) return send(request, response, 404, { error: 'Customer not found.' })
+      const transactions = storedValue('udhar-transactions').value
+      const customerTransactions = Array.isArray(transactions) ? transactions.filter((entry) => String(entry?.customerId) === id) : []
+      const transactionBalance = customerTransactions.reduce((sum, entry) => sum + Number(entry?.debit || 0) - Number(entry?.credit || 0), 0)
+      const hasOpeningEntry = customerTransactions.some((entry) => entry?.type === 'Opening Balance')
+      const outstanding = hasOpeningEntry ? transactionBalance : Number(customer.openingBalance || 0) + transactionBalance
+      const linkedKeys = ['sales', 'discount-rules', 'family-adjustments', 'fleet-vehicles', 'fleet-allocations']
+      const hasLinkedRecords = linkedKeys.some((key) => {
+        const value = storedValue(key).value
+        return Array.isArray(value) && value.some((entry) =>
+          String(entry?.customerId) === id ||
+          String(entry?.companyId) === id ||
+          (key === 'sales' && entry?.mode === 'Credit' && entry?.customer === customer.name))
+      })
+      if (outstanding > 0) return send(request, response, 409, { error: 'Customer has an outstanding balance and cannot be deleted.' })
+      if (customerTransactions.length || hasLinkedRecords) {
+        return send(request, response, 409, { error: 'Customer has linked financial or historical records and cannot be deleted.' })
+      }
+      const result = deleteRegisterRecord(user, 'customers', id)
+      if (result.missing) return send(request, response, 404, { error: 'Customer not found.' })
+      return send(request, response, 200, { ok: true, version: result.version })
     }
 
     if (url.pathname.startsWith('/api/state/')) {
       const key = decodeURIComponent(url.pathname.slice('/api/state/'.length))
       if (!allowedKeys.has(key)) return send(request, response, 404, { error: 'Unknown register key.' })
       if (request.method === 'GET') {
-        const record = db.prepare('SELECT value_json FROM register_state WHERE key = ?').get(key)
-        return send(request, response, 200, { value: record ? JSON.parse(record.value_json) : null })
+        if (!roleCanAccessKey(user, key, 'read')) return send(request, response, 403, { error: 'This role cannot read this register.' })
+        return send(request, response, 200, storedValue(key))
       }
       if (request.method === 'PUT') {
-        if (user.role === 'operator' && ['bank-accounts', 'brs-records', 'payment-fees', 'commission-records'].includes(key)) return send(request, response, 403, { error: 'This role cannot modify accounting settings.' })
+        if (!roleCanAccessKey(user, key, 'write')) return send(request, response, 403, { error: 'This role cannot modify this register.' })
         const input = await body(request)
-        db.prepare(`INSERT INTO register_state (key, value_json, updated_at, updated_by) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at, updated_by = excluded.updated_by`).run(key, JSON.stringify(input.value), new Date().toISOString(), user.id)
-        audit(user, 'write', key)
-        return send(request, response, 200, { ok: true })
+        if (!Number.isInteger(input.version)) return send(request, response, 428, { error: 'A register version is required. Reload the register and try again.' })
+        const result = writeRegister(user, key, input.value, input.version)
+        if (result.conflict) return send(request, response, 409, { error: 'This register changed after it was loaded. Reload it before saving.', value: result.value, version: result.version })
+        if (result.guardedDelete) return send(request, response, 403, { error: 'Use the guarded delete operation for sales and customers.' })
+        if (result.forbidden) return send(request, response, 403, { error: 'This role cannot delete register records.' })
+        return send(request, response, 200, { ok: true, version: result.version })
       }
     }
 
