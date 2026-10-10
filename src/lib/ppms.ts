@@ -88,6 +88,22 @@ export type FuelStockSummaryInput = {
   adjustment: number
 }
 
+export type FuelProduct = 'HSD' | 'PMG' | 'XTRON'
+
+export type FuelInventoryValuation = {
+  openingInventoryValue: number | null
+  netPurchasesAndEligibleAcquisitionCosts: number
+  closingInventoryValue: number | null
+}
+
+export type FuelCogsInput = Record<FuelProduct, FuelInventoryValuation>
+
+export type FuelCogsResult = {
+  byProduct: Record<FuelProduct, { available: boolean; cogs: number | null }>
+  available: boolean
+  totalCogs: number | null
+}
+
 export type DiscountInput = {
   litres: number
   rate: number
@@ -523,6 +539,66 @@ export function calculateFuelStockSummary({ product, opening, purchased, sold, a
     sold,
     adjustment,
     remaining,
+  }
+}
+
+export function calculateFuelCostOfGoodsSold(input: FuelCogsInput): FuelCogsResult {
+  const products: FuelProduct[] = ['HSD', 'PMG', 'XTRON']
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    throw new TypeError('Fuel inventory valuations must be provided for HSD, PMG, and XTRON.')
+  }
+
+  const inputKeys = Object.keys(input)
+  if (inputKeys.length !== products.length || products.some((product) => !Object.hasOwn(input, product))) {
+    throw new TypeError('Fuel inventory valuations must contain exactly HSD, PMG, and XTRON.')
+  }
+
+  const byProduct = {} as FuelCogsResult['byProduct']
+  let totalCogs = 0
+  let available = true
+
+  for (const product of products) {
+    const valuation = input[product]
+    const valuationKeys = ['openingInventoryValue', 'netPurchasesAndEligibleAcquisitionCosts', 'closingInventoryValue']
+    if (!valuation || typeof valuation !== 'object' || Array.isArray(valuation)
+      || Object.keys(valuation).length !== valuationKeys.length
+      || valuationKeys.some((key) => !Object.hasOwn(valuation, key))) {
+      throw new TypeError(`${product} valuation must contain opening value, net purchases and eligible acquisition costs, and closing value.`)
+    }
+
+    const { openingInventoryValue, netPurchasesAndEligibleAcquisitionCosts, closingInventoryValue } = valuation
+    if (openingInventoryValue !== null && (!Number.isFinite(openingInventoryValue) || openingInventoryValue < 0)) {
+      throw new RangeError(`${product} opening inventory value must be null or a finite non-negative number.`)
+    }
+    if (!Number.isFinite(netPurchasesAndEligibleAcquisitionCosts) || netPurchasesAndEligibleAcquisitionCosts < 0) {
+      throw new RangeError(`${product} net purchases and eligible acquisition costs must be a finite non-negative number.`)
+    }
+    if (closingInventoryValue !== null && (!Number.isFinite(closingInventoryValue) || closingInventoryValue < 0)) {
+      throw new RangeError(`${product} closing inventory value must be null or a finite non-negative number.`)
+    }
+
+    const productAvailable = openingInventoryValue !== null && closingInventoryValue !== null
+    const cogs = productAvailable
+      ? openingInventoryValue + netPurchasesAndEligibleAcquisitionCosts - closingInventoryValue
+      : null
+    if (cogs !== null && !Number.isFinite(cogs)) {
+      throw new RangeError(`${product} COGS calculation exceeds the supported numeric range.`)
+    }
+    byProduct[product] = { available: productAvailable, cogs }
+    if (cogs === null) {
+      available = false
+    } else {
+      totalCogs += cogs
+      if (!Number.isFinite(totalCogs)) {
+        throw new RangeError('Total fuel COGS calculation exceeds the supported numeric range.')
+      }
+    }
+  }
+
+  return {
+    byProduct,
+    available,
+    totalCogs: available ? totalCogs : null,
   }
 }
 

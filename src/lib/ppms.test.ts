@@ -18,6 +18,8 @@ import {
   recalculateMeterReadingChain,
   calculateMeterPeriodSummary,
   getMeterTestsForReading,
+  calculateFuelCostOfGoodsSold,
+  type FuelCogsInput,
 } from './ppms'
 
 describe('petrol pump accounting logic', () => {
@@ -318,6 +320,97 @@ describe('petrol pump accounting logic', () => {
       sold: 8500,
       adjustment: 500,
     }).remaining).toBe(22000)
+  })
+
+  describe('fuel cost of goods sold', () => {
+    const completeValuations: FuelCogsInput = {
+      HSD: { openingInventoryValue: 100000, netPurchasesAndEligibleAcquisitionCosts: 50000, closingInventoryValue: 120000 },
+      PMG: { openingInventoryValue: 80000, netPurchasesAndEligibleAcquisitionCosts: 30000, closingInventoryValue: 70000 },
+      XTRON: { openingInventoryValue: 20000, netPurchasesAndEligibleAcquisitionCosts: 10000, closingInventoryValue: 25000 },
+    }
+
+    it('calculates COGS using valued opening inventory, net acquisitions, and valued closing inventory', () => {
+      const result = calculateFuelCostOfGoodsSold(completeValuations)
+
+      expect(result.byProduct.HSD).toEqual({ available: true, cogs: 30000 })
+      expect(result.byProduct.PMG).toEqual({ available: true, cogs: 40000 })
+      expect(result.byProduct.XTRON).toEqual({ available: true, cogs: 5000 })
+      expect(result.available).toBe(true)
+      expect(result.totalCogs).toBe(75000)
+    })
+
+    it('distinguishes zero-valued inventories from missing valuations', () => {
+      const zeroValuations: FuelCogsInput = {
+        HSD: { openingInventoryValue: 0, netPurchasesAndEligibleAcquisitionCosts: 100, closingInventoryValue: 0 },
+        PMG: { openingInventoryValue: 0, netPurchasesAndEligibleAcquisitionCosts: 0, closingInventoryValue: 0 },
+        XTRON: { openingInventoryValue: 0, netPurchasesAndEligibleAcquisitionCosts: 0, closingInventoryValue: 0 },
+      }
+      const zeroResult = calculateFuelCostOfGoodsSold(zeroValuations)
+      expect(zeroResult.byProduct.HSD).toEqual({ available: true, cogs: 100 })
+      expect(zeroResult.byProduct.PMG).toEqual({ available: true, cogs: 0 })
+      expect(zeroResult.totalCogs).toBe(100)
+
+      const missingResult = calculateFuelCostOfGoodsSold({
+        ...zeroValuations,
+        HSD: { ...zeroValuations.HSD, openingInventoryValue: null },
+      })
+      expect(missingResult.byProduct.HSD).toEqual({ available: false, cogs: null })
+      expect(missingResult.available).toBe(false)
+      expect(missingResult.totalCogs).toBeNull()
+    })
+
+    it('allows purchases to differ from COGS when closing inventory changes', () => {
+      const result = calculateFuelCostOfGoodsSold({
+        ...completeValuations,
+        HSD: { openingInventoryValue: 100000, netPurchasesAndEligibleAcquisitionCosts: 50000, closingInventoryValue: 120000 },
+      })
+
+      expect(result.byProduct.HSD.cogs).toBe(30000)
+      expect(result.byProduct.HSD.cogs).not.toBe(50000)
+    })
+
+    it.each([
+      ['negative opening value', { openingInventoryValue: -1, netPurchasesAndEligibleAcquisitionCosts: 0, closingInventoryValue: 0 }],
+      ['negative acquisition costs', { openingInventoryValue: 0, netPurchasesAndEligibleAcquisitionCosts: -1, closingInventoryValue: 0 }],
+      ['negative closing value', { openingInventoryValue: 0, netPurchasesAndEligibleAcquisitionCosts: 0, closingInventoryValue: -1 }],
+      ['non-finite opening value', { openingInventoryValue: Number.POSITIVE_INFINITY, netPurchasesAndEligibleAcquisitionCosts: 0, closingInventoryValue: 0 }],
+      ['non-numeric acquisition costs', { openingInventoryValue: 0, netPurchasesAndEligibleAcquisitionCosts: Number.NaN, closingInventoryValue: 0 }],
+      ['non-numeric closing value', { openingInventoryValue: 0, netPurchasesAndEligibleAcquisitionCosts: 0, closingInventoryValue: '0' }],
+    ])('rejects %s', (_description, hsdValuation) => {
+      expect(() => calculateFuelCostOfGoodsSold({
+        ...completeValuations,
+        HSD: hsdValuation,
+      } as unknown as FuelCogsInput)).toThrow()
+    })
+
+    it('rejects missing fuel types and unrelated revenue, collection, or commission inputs', () => {
+      const { XTRON: _xtron, ...missingXtron } = completeValuations
+      expect(() => calculateFuelCostOfGoodsSold(missingXtron as FuelCogsInput)).toThrow('exactly HSD, PMG, and XTRON')
+
+      const quantitiesOnly = {
+        HSD: { openingQuantity: 100, purchasedQuantity: 50, closingQuantity: 120 },
+        PMG: { openingQuantity: 80, purchasedQuantity: 30, closingQuantity: 70 },
+        XTRON: { openingQuantity: 20, purchasedQuantity: 10, closingQuantity: 25 },
+      }
+      expect(() => calculateFuelCostOfGoodsSold(quantitiesOnly as unknown as FuelCogsInput)).toThrow('valuation must contain opening value')
+
+      const withNonAcquisitionAmounts = {
+        ...completeValuations,
+        customerCollections: 1000000,
+        fuelSalesRevenue: 2000000,
+        commission: 3000,
+      }
+      expect(() => calculateFuelCostOfGoodsSold(withNonAcquisitionAmounts as FuelCogsInput)).toThrow('exactly HSD, PMG, and XTRON')
+    })
+
+    it('rejects arithmetic that overflows the supported numeric range', () => {
+      const valuations: FuelCogsInput = {
+        HSD: { openingInventoryValue: Number.MAX_VALUE, netPurchasesAndEligibleAcquisitionCosts: Number.MAX_VALUE, closingInventoryValue: 0 },
+        PMG: { openingInventoryValue: 0, netPurchasesAndEligibleAcquisitionCosts: 0, closingInventoryValue: 0 },
+        XTRON: { openingInventoryValue: 0, netPurchasesAndEligibleAcquisitionCosts: 0, closingInventoryValue: 0 },
+      }
+      expect(() => calculateFuelCostOfGoodsSold(valuations)).toThrow('exceeds the supported numeric range')
+    })
   })
 
   it('calculates commission from explicitly commissionable litres', () => {
