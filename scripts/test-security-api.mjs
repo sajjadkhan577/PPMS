@@ -1,19 +1,20 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createServer as createNetServer } from 'node:net'
-import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 
 const projectRoot = resolve(import.meta.dirname, '..')
-const tempRoot = join(tmpdir(), `ppms-security-api-${process.pid}-${Date.now()}`)
+const tempRoot = mkdtempSync(join(tmpdir(), 'ppms-security-api-'))
 const dataDirectory = join(tempRoot, 'data')
 const backupDirectory = join(tempRoot, 'backups')
 const databasePath = join(dataDirectory, 'ppms.sqlite')
 const startupPassword = 'Temporary-Admin-Password-123!'
 let child
+let childExit
 let port
 
 async function findPort() {
@@ -33,6 +34,7 @@ async function startServer() {
       PPMS_DESKTOP: '0',
       PPMS_HOST: '127.0.0.1',
       PPMS_PORT: String(port),
+      PPMS_APP_ROOT: tempRoot,
       PPMS_DB_PATH: databasePath,
       PPMS_BACKUP_DIR: backupDirectory,
       PPMS_LOG_DIR: join(tempRoot, 'logs'),
@@ -42,6 +44,7 @@ async function startServer() {
     },
     stdio: ['ignore', 'ignore', 'pipe'],
   })
+  childExit = new Promise((resolveExit) => child.once('exit', resolveExit))
   let stderr = ''
   child.stderr.setEncoding('utf8')
   child.stderr.on('data', (chunk) => { stderr += chunk })
@@ -57,14 +60,24 @@ async function startServer() {
 }
 
 async function stopServer() {
-  if (!child || child.exitCode !== null) return
-  child.kill('SIGTERM')
-  await Promise.race([
-    new Promise((resolveExit) => child.once('exit', resolveExit)),
-    delay(5000).then(() => {
-      if (child && child.exitCode === null) child.kill('SIGKILL')
-    }),
-  ])
+  if (!child) return
+  if (child.exitCode === null) {
+    child.kill('SIGTERM')
+    const stopped = await Promise.race([
+      childExit.then(() => true),
+      delay(5000).then(() => false),
+    ])
+    if (!stopped && child.exitCode === null) {
+      child.kill('SIGKILL')
+      await Promise.race([
+        childExit,
+        delay(5000).then(() => {
+          throw new Error('Temporary security API server did not stop after SIGKILL.')
+        }),
+      ])
+    }
+  }
+  child = null
 }
 
 async function request(path, { token, method = 'GET', body } = {}) {
@@ -100,7 +113,6 @@ function inspectDatabase(path) {
 }
 
 try {
-  mkdirSync(tempRoot, { recursive: true })
   await startServer()
 
   const admin = await login('admin', startupPassword)
@@ -124,6 +136,8 @@ try {
   assert.equal(saved.payload.version, 1)
   assert.equal((await request('/api/state/sales', { token: operator, method: 'PUT', body: { value: [], version: 1 } })).status, 403, 'Operators must not delete sales through generic register replacement.')
   assert.equal((await request('/api/sales/101', { token: operator, method: 'DELETE' })).status, 403, 'Operators must not delete a sale directly.')
+  assert.equal((await request('/api/system/reset-registers', { token: operator, method: 'POST', body: { confirmation: 'RESET ALL REGISTER DATA' } })).status, 403)
+  assert.deepEqual((await request('/api/state/sales', { token: admin })).payload.value, initialSales, 'Denied operator reset must leave business records intact.')
 
   const operatorRead = await request('/api/state/sales', { token: operator })
   assert.equal(operatorRead.status, 200)
@@ -233,9 +247,11 @@ try {
   assert.equal(deniedRegisterRestore.status, 403)
   const invalidRegisterRestore = await request('/api/system/restore-registers', { token: admin, method: 'POST', body: { backup: '{}' } })
   assert.equal(invalidRegisterRestore.status, 400, 'Register restore must retain backup validation.')
+  const preRegisterRestore = await request('/api/state/sales', { token: admin })
   const registerBackup = JSON.stringify({ version: 1, createdAt: new Date().toISOString(), data: { sales: [{ id: 404, date: '2026-10-04', product: 'PMG', litres: 2, rate: 3, amount: 6, mode: 'Cash', customer: '-' }] } })
   const restoredRegisters = await request('/api/system/restore-registers', { token: admin, method: 'POST', body: { backup: registerBackup } })
   assert.equal(restoredRegisters.status, 200)
+  assert.equal((await request('/api/state/sales', { token: admin, method: 'PUT', body: { value: [], version: preRegisterRestore.payload.version } })).status, 409, 'Register restore must advance versions so stale clients cannot overwrite restored data.')
   assert.deepEqual((await request('/api/state/sales', { token: admin })).payload.value.map((sale) => sale.id), [404])
 
   const operatorAfterLogout = await request('/api/auth/logout', { token: operator, method: 'POST' })
@@ -245,6 +261,9 @@ try {
 
   console.log('Security API regression tests passed: authorization, customer/sale deletion, version conflicts, reset safety, backup failure, restore, login, and logout.')
 } finally {
-  await stopServer()
-  rmSync(tempRoot, { recursive: true, force: true })
+  try {
+    await stopServer()
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true })
+  }
 }
