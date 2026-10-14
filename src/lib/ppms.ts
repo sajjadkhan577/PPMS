@@ -53,6 +53,8 @@ export type DashboardSummaryInput = {
     customerId?: number
     discount?: number
     discountAmount?: number
+    vehicleId?: number
+    reference?: string
   }>
   expenses: Array<{
     id: number
@@ -61,8 +63,10 @@ export type DashboardSummaryInput = {
     description: string
     amount: number
     paidBy: string
+    salaryId?: number
   }>
-  otherSales?: Array<{ date: string; amount: number }>
+  otherSales?: Array<{ id?: number; date: string; amount: number }>
+  salaries?: Array<{ id: number; date: string; net: number; status: string }>
   customers?: Array<{ id: number; openingBalance: number }>
   udhar: Array<{
     id: number
@@ -73,6 +77,9 @@ export type DashboardSummaryInput = {
     description: string
     debit: number
     credit: number
+    vehicleId?: number
+    litres?: number
+    fuelType?: string
   }>
   commission?: Array<{
     date: string
@@ -368,6 +375,70 @@ export function calculateVehicleUsageSummary({ limit, used, month }: { limit: nu
   }
 }
 
+export function validateFleetCreditTransaction({ litres, rate, remainingAllowance }: { litres: number; rate: number; remainingAllowance: number }) {
+  if (!Number.isFinite(litres) || litres <= 0) {
+    throw new RangeError('Litres must be a valid number greater than zero.')
+  }
+  if (!Number.isFinite(rate) || rate < 0) {
+    throw new RangeError('Rate must be a valid non-negative number.')
+  }
+  if (!Number.isFinite(remainingAllowance)) {
+    throw new RangeError('The vehicle allowance is invalid.')
+  }
+  const amount = litres * rate
+  if (!Number.isFinite(amount) || amount < 0) {
+    throw new RangeError('Credit sale amount must be a valid non-negative number.')
+  }
+  if (litres > Math.max(0, remainingAllowance) + 0.000001) {
+    throw new RangeError(`This transaction exceeds the vehicle's remaining allowance of ${Math.max(0, remainingAllowance).toLocaleString()} L.`)
+  }
+  return amount
+}
+
+type FleetAllowanceTransaction = {
+  id?: number
+  customerId: number
+  vehicleId?: number
+  date: string
+  type: string
+  litres?: number
+}
+
+export function calculateFleetVehicleUsage({
+  companyId,
+  vehicleId,
+  month,
+  allocations,
+  transactions,
+  excludeTransactionId,
+}: {
+  companyId: number
+  vehicleId: number
+  month: string
+  allocations: Array<{ customerId: number; vehicleId: number; month: string; monthlyLitresLimit: number }>
+  transactions: FleetAllowanceTransaction[]
+  excludeTransactionId?: number
+}) {
+  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) {
+    throw new RangeError('Fleet allowance month must use YYYY-MM format.')
+  }
+  const [year, monthNumber] = month.split('-').map(Number)
+  const monthEnd = `${month}-${String(new Date(year, monthNumber, 0).getDate()).padStart(2, '0')}`
+  const limit = allocations
+    .filter((allocation) => allocation.customerId === companyId && allocation.vehicleId === vehicleId && allocation.month === month)
+    .reduce((sum, allocation) => sum + (Number.isFinite(allocation.monthlyLitresLimit) && allocation.monthlyLitresLimit >= 0 ? allocation.monthlyLitresLimit : 0), 0)
+  const used = transactions
+    .filter((transaction) => (excludeTransactionId === undefined || transaction.id !== excludeTransactionId)
+      && transaction.customerId === companyId
+      && transaction.vehicleId === vehicleId
+      && transaction.type === 'Credit Sale'
+      && isDateWithinRange(transaction.date, `${month}-01`, monthEnd)
+      && Number.isFinite(transaction.litres)
+      && (transaction.litres as number) > 0)
+    .reduce((sum, transaction) => sum + (transaction.litres as number), 0)
+  return calculateVehicleUsageSummary({ limit, used, month })
+}
+
 export function calculateCompanyFleetSummary({
   companyId,
   vehicles,
@@ -378,7 +449,7 @@ export function calculateCompanyFleetSummary({
   companyId: number
   vehicles: Array<{ id: number; customerId: number; vehicleNumber: string; status?: string }>
   allocations: Array<{ customerId: number; vehicleId: number; month: string; monthlyLitresLimit: number }>
-  transactions: Array<{ customerId: number; vehicleId: number; date: string; type: string; litres?: number; debit?: number; credit?: number }>
+  transactions: Array<{ id?: number; customerId: number; vehicleId: number; date: string; type: string; litres?: number; debit?: number; credit?: number }>
   month: string
 }) {
   const activeVehicles = vehicles.filter((vehicle) => vehicle.customerId === companyId && (vehicle.status || 'Active') !== 'Inactive')
@@ -387,18 +458,9 @@ export function calculateCompanyFleetSummary({
   let overLimitVehicles = 0
 
   for (const vehicle of activeVehicles) {
-    const limit = allocations
-      .filter((allocation) => allocation.customerId === companyId && allocation.vehicleId === vehicle.id && allocation.month === month)
-      .reduce((sum, allocation) => sum + Math.max(0, Number(allocation.monthlyLitresLimit || 0)), 0)
-
-    const used = transactions
-      .filter((transaction) => transaction.customerId === companyId && transaction.vehicleId === vehicle.id && transaction.date.startsWith(month) && transaction.type === 'Credit Sale')
-      .reduce((sum, transaction) => sum + Math.max(0, Number(transaction.litres || 0)), 0)
-
-    totalAllocation += limit
-    totalUsed += used
-
-    const summary = calculateVehicleUsageSummary({ limit, used, month })
+    const summary = calculateFleetVehicleUsage({ companyId, vehicleId: vehicle.id, month, allocations, transactions })
+    totalAllocation += summary.limit
+    totalUsed += summary.used
     if (summary.exceeded > 0 || summary.status === 'Limit Reached') overLimitVehicles += 1
   }
 
@@ -473,34 +535,66 @@ export function calculateProfitLoss({
   }
 }
 
-export function getDashboardSummary({ startDate, endDate, sales, expenses, udhar, otherSales = [], customers = [], commission: commissionRecords = [] }: DashboardSummaryInput) {
-  const filteredSales = sales.filter((sale) => isDateWithinRange(sale.date, startDate, endDate))
-  const filteredExpenses = expenses.filter((expense) => isDateWithinRange(expense.date, startDate, endDate) && expense.category !== 'Commission')
-  const filteredUdhar = udhar.filter((entry) => isDateWithinRange(entry.date, startDate, endDate))
-  const filteredOtherSales = otherSales.filter((sale) => isDateWithinRange(sale.date, startDate, endDate))
+export function getDashboardSummary({ startDate, endDate, sales, expenses, udhar, otherSales = [], salaries = [], customers = [], commission: commissionRecords = [] }: DashboardSummaryInput) {
+  const salesById = new Map<number, DashboardSummaryInput['sales'][number]>()
+  sales.forEach((sale) => salesById.set(sale.id, sale))
+  const uniqueSales = [...salesById.values()]
+  const filteredSales = uniqueSales.filter((sale) => isDateWithinRange(sale.date, startDate, endDate)
+    && Number.isFinite(sale.amount) && sale.amount >= 0
+    && Number.isFinite(sale.litres) && sale.litres >= 0)
+  const filteredExpenses = expenses.filter((expense) => isDateWithinRange(expense.date, startDate, endDate)
+    && expense.category !== 'Commission' && Number.isFinite(expense.amount))
+  const udharById = new Map<number, DashboardSummaryInput['udhar'][number]>()
+  udhar.forEach((entry) => udharById.set(entry.id, entry))
+  const uniqueUdhar = [...udharById.values()]
+  const filteredUdhar = uniqueUdhar.filter((entry) => isDateWithinRange(entry.date, startDate, endDate)
+    && Number.isFinite(entry.debit) && entry.debit >= 0
+    && Number.isFinite(entry.credit) && entry.credit >= 0)
+  const otherSalesById = new Map<number, NonNullable<DashboardSummaryInput['otherSales']>[number]>()
+  const undeduplicatedOtherSales: NonNullable<DashboardSummaryInput['otherSales']> = []
+  otherSales.forEach((sale) => {
+    if (sale.id === undefined) undeduplicatedOtherSales.push(sale)
+    else otherSalesById.set(sale.id, sale)
+  })
+  const filteredOtherSales = [...otherSalesById.values(), ...undeduplicatedOtherSales]
+    .filter((sale) => isDateWithinRange(sale.date, startDate, endDate) && Number.isFinite(sale.amount) && sale.amount >= 0)
   const commission = getCommissionTotal({ startDate, endDate, records: commissionRecords })
 
-  const totalSales = filteredSales.reduce((sum, sale) => sum + sale.amount, 0)
+  const totalFuelSales = filteredSales.reduce((sum, sale) => sum + sale.amount, 0)
   const totalFuelLitres = filteredSales.reduce((sum, sale) => sum + sale.litres, 0)
   const creditSales = filteredSales.filter((sale) => sale.mode === 'Credit').reduce((sum, sale) => sum + sale.amount, 0)
+  const totalOtherSales = filteredOtherSales.reduce((sum, sale) => sum + sale.amount, 0)
+  const totalSales = totalFuelSales + totalOtherSales
   const cashSales = totalSales - creditSales
   const totalExpenses = filteredExpenses.reduce((sum, expense) => sum + expense.amount, 0)
   const customerPayments = filteredUdhar.filter((item) => item.type === 'Payment Received').reduce((sum, item) => sum + item.credit, 0)
   const creditPosted = filteredUdhar.filter((item) => item.type === 'Credit Sale').reduce((sum, item) => sum + item.debit, 0)
-  const totalOtherSales = filteredOtherSales.reduce((sum, sale) => sum + sale.amount, 0)
+  const linkedSalaryIds = new Set(filteredExpenses
+    .filter((expense) => expense.category === 'Salary' && Number.isInteger(expense.salaryId))
+    .map((expense) => expense.salaryId as number))
+  const filteredPaidSalaries = salaries.filter((salary) => salary.status === 'Paid'
+    && Number.isFinite(salary.net) && salary.net >= 0
+    && isDateWithinRange(salary.date, startDate, endDate))
+  const salariesPaid = filteredPaidSalaries.reduce((sum, salary) => sum + salary.net, 0)
+  const salariesNotIncludedInExpenses = filteredPaidSalaries
+    .filter((salary) => !linkedSalaryIds.has(salary.id))
+    .reduce((sum, salary) => sum + salary.net, 0)
   const productTotals = filteredSales.reduce<Record<string, { litres: number; amount: number }>>((totals, sale) => {
     const current = totals[sale.product] || { litres: 0, amount: 0 }
     totals[sale.product] = { litres: current.litres + sale.litres, amount: current.amount + sale.amount }
     return totals
   }, { HSD: { litres: 0, amount: 0 }, PMG: { litres: 0, amount: 0 }, XTRON: { litres: 0, amount: 0 } })
   const normalizedEndDate = normalizeLocalCalendarDate(endDate)
-  const ledgerEntriesAsOf = udhar.filter((entry) => {
+  const ledgerEntriesAsOf = uniqueUdhar.filter((entry) => {
     const date = normalizeLocalCalendarDate(entry.date)
     return Boolean(date && normalizedEndDate && date <= normalizedEndDate)
+      && ['Opening Balance', 'Credit Sale', 'Payment Received', 'Adjustment'].includes(entry.type)
+      && Number.isFinite(entry.debit) && entry.debit >= 0
+      && Number.isFinite(entry.credit) && entry.credit >= 0
   })
   const receivablesAsOf = customers.length
     ? customers.reduce((total, customer) => {
-      const customerLedger = udhar.filter((entry) => entry.customerId === customer.id)
+      const customerLedger = uniqueUdhar.filter((entry) => entry.customerId === customer.id)
       const entriesAsOf = ledgerEntriesAsOf.filter((entry) => entry.customerId === customer.id)
       const hasOpeningLedgerEntry = customerLedger.some((entry) => entry.type === 'Opening Balance')
       const ledgerBalance = entriesAsOf.reduce((balance, entry) => balance + entry.debit - entry.credit, 0)
@@ -510,17 +604,20 @@ export function getDashboardSummary({ startDate, endDate, sales, expenses, udhar
 
   return {
     totalSales,
+    totalFuelSales,
     totalFuelLitres,
     cashSales,
     creditSales,
     totalExpenses,
+    salariesPaid,
+    salariesNotIncludedInExpenses,
     commission,
-    operatingExpenses: totalExpenses + commission,
+    operatingExpenses: totalExpenses + commission + salariesNotIncludedInExpenses,
     customerPayments,
     creditPosted,
     totalOtherSales,
     productTotals,
-    netSales: totalSales + totalOtherSales - totalExpenses - commission,
+    netSales: totalSales - totalExpenses - commission - salariesNotIncludedInExpenses,
     outstandingReceivables: receivablesAsOf,
   }
 }
@@ -604,20 +701,26 @@ export function calculateFuelCostOfGoodsSold(input: FuelCogsInput): FuelCogsResu
 
 export function calculateDiscountAmount({ litres, rate, discountType, discountValue }: DiscountInput) {
   const grossAmount = litres * rate
-  const safeDiscountValue = Math.max(0, discountValue)
+  const safeDiscountValue = Math.max(0, Number.isFinite(discountValue) ? discountValue : 0)
+  if (!Number.isFinite(litres) || litres < 0) return 0
+  if (!Number.isFinite(rate) || rate < 0) return 0
 
   if (discountType === 'percent') {
-    const discount = grossAmount * (safeDiscountValue / 100)
-    return discount
+    const percent = Math.max(0, safeDiscountValue)
+    return Math.min(grossAmount, grossAmount * (percent / 100))
   }
 
-  return Math.min(grossAmount, litres * safeDiscountValue)
+  return Math.min(grossAmount, Math.max(0, safeDiscountValue) * litres)
 }
 
 export function calculatePaymentFee({ amount, feePercent }: PaymentFeeInput) {
-  return Math.max(0, amount) * (Math.max(0, feePercent) / 100)
+  if (!Number.isFinite(amount) || amount < 0) return 0
+  if (!Number.isFinite(feePercent) || feePercent <= 0) return 0
+  return amount * (Math.max(0, feePercent) / 100)
 }
 
-export function calculateCommissionAmount(commissionableLitres: number, ratePerLitre: number) {
-  return Math.max(0, commissionableLitres) * Math.max(0, ratePerLitre)
+export function calculateCommissionAmount(litres: number, rate: number) {
+  if (!Number.isFinite(litres) || litres < 0) return 0
+  if (!Number.isFinite(rate) || rate < 0) return 0
+  return litres * rate
 }

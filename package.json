@@ -14,7 +14,7 @@
     "electron:dev": "npm run build && electron electron/main.cjs",
     "dist:win": "node scripts/package-windows.mjs",
     "preview": "vite preview",
-    "test": "vitest run && node --test electron/runtime-paths-check.cjs && node scripts/test-desktop-server.mjs && node scripts/test-security-api.mjs",
+    "test": "vitest run && node --test electron/runtime-paths-check.cjs && node scripts/test-desktop-server.mjs && node scripts/test-security-api.mjs && node scripts/test-fleet-credit-api.mjs",
     "desktop:seed": "node scripts/create-desktop-seed.mjs"
   },
   "main": "electron/main.cjs",

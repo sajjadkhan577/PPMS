@@ -1,6 +1,6 @@
 import { FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 import './styles.css'
-import { calculateCommissionAmount, calculateCompanyFleetSummary, calculateDiscountAmount, calculateFuelStockSummary, calculateMeterPeriodSummary, calculateMeterTotal, calculatePaymentFee, calculateVehicleUsageSummary, findPreviousMeterReading, getCommissionTotal, getDashboardDateRange, getDashboardSummary, getMeterTestsForReading, normalizeLocalCalendarDate, recalculateMeterReadingChain, type MeterTestEntry } from './lib/ppms'
+import { calculateCommissionAmount, calculateCompanyFleetSummary, calculateDiscountAmount, calculateFleetVehicleUsage, calculateFuelStockSummary, calculateMeterPeriodSummary, calculateMeterTotal, calculatePaymentFee, findPreviousMeterReading, getCommissionTotal, getDashboardDateRange, getDashboardSummary, getMeterTestsForReading, normalizeLocalCalendarDate, recalculateMeterReadingChain, validateFleetCreditTransaction, type MeterTestEntry } from './lib/ppms'
 import { createBackup, parseBackup, readStored, restoreBackup, writeStored } from './lib/storage'
 
 type Product = 'HSD' | 'PMG' | 'XTRON'
@@ -27,11 +27,18 @@ type Sale = {
   vehicleId?: number
   reference?: string
 }
-type Customer = { id: number; name: string; phone: string; address: string; openingBalance: number }
+type Customer = { id: number; name: string; phone: string; address: string; openingBalance: number; active?: boolean }
+type AtomicRegisterCommit = { registers: Record<string, { value: unknown; version: number }> }
+type FleetCreditCommitResponse = {
+  sales: Sale[]
+  transactions: UdharTransaction[]
+  versions: { sales: number; 'udhar-transactions': number }
+  alreadyApplied: boolean
+}
 type FleetVehicle = { id: number; customerId: number; vehicleNumber: string; vehicleName: string; driverName: string; fuelType: string; status: 'Active' | 'Inactive'; notes: string; createdAt: string; updatedAt: string }
 type FleetAllocation = { id: number; customerId: number; vehicleId: number; month: string; monthlyLitresLimit: number; createdAt: string; updatedAt: string }
 type UdharTransaction = { id: number; date: string; customerId: number; type: 'Opening Balance' | 'Credit Sale' | 'Payment Received' | 'Adjustment'; reference: string; description: string; debit: number; credit: number; paymentMethod?: string; vehicleId?: number; fuelType?: string; litres?: number }
-type Expense = { id: number; date: string; category: string; description: string; amount: number; paidBy: string }
+type Expense = { id: number; date: string; category: string; description: string; amount: number; paidBy: string; salaryId?: number }
 type EmployeeSalary = { id: number; date: string; period: string; employee: string; gross: number; deductions: number; net: number; paidBy: string; status: 'Paid' | 'Pending'; notes: string }
 type Purchase = { id: number; date: string; product: Product; litres: number; rate: number; supplier: string; amount: number }
 type OilSale = { id: number; date: string; item: string; quantity: number; rate: number; amount: number }
@@ -190,10 +197,15 @@ const API_URL = 'http://127.0.0.1:8787'
 
 async function apiRequest<T>(path: string, options: RequestInit = {}) {
   const token = localStorage.getItem('ppms-session-token')
+  const requestUrl = `${API_URL}${path}`
+  const method = options.method || 'GET'
   const response = await fetch(`${API_URL}${path}`, { ...options, headers: { 'content-type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(options.headers || {}) } })
   const payload = await response.json() as T & { error?: string }
   if (!response.ok) {
-    const error = new Error(payload.error || 'Request failed.') as Error & { status: number }
+    const message = response.status === 404
+      ? `${payload.error || 'Endpoint not found.'} (HTTP 404: ${method} ${requestUrl}). The PPMS server may need restarting to load this endpoint.`
+      : payload.error || 'Request failed.'
+    const error = new Error(message) as Error & { status: number }
     error.status = response.status
     throw error
   }
@@ -215,6 +227,20 @@ function useStored<T>(key: string, initial: T, normalize: (value: unknown) => T 
   })
   const version = useRef<number | null>(null)
   const saveQueue = useRef<Promise<void>>(Promise.resolve())
+  const saveGeneration = useRef(0)
+  const skipRemoteWrite = useRef<string | null>(null)
+  useEffect(() => {
+    const handleAtomicCommit = (event: Event) => {
+      const detail = (event as CustomEvent<AtomicRegisterCommit>).detail
+      const register = detail?.registers?.[key]
+      if (!register) return
+      version.current = register.version
+      saveGeneration.current += 1
+      skipRemoteWrite.current = JSON.stringify(register.value)
+    }
+    window.addEventListener('ppms-atomic-register-commit', handleAtomicCommit)
+    return () => window.removeEventListener('ppms-atomic-register-commit', handleAtomicCommit)
+  }, [key])
   useEffect(() => {
     if (!remoteToken || !canRead) {
       if (remoteToken && !canRead) {
@@ -237,7 +263,14 @@ function useStored<T>(key: string, initial: T, normalize: (value: unknown) => T 
     writeStored(localStorage, `ppms-${key}`, value)
     window.dispatchEvent(new Event(`ppms-${key}-updated`))
     if (remoteToken) {
+      const serializedValue = JSON.stringify(value)
+      if (skipRemoteWrite.current === serializedValue) {
+        skipRemoteWrite.current = null
+        return
+      }
+      const generation = saveGeneration.current
       saveQueue.current = saveQueue.current.then(async () => {
+        if (generation !== saveGeneration.current) return
         const payload = await apiRequest<{ version: number }>(`/api/state/${key}`, { method: 'PUT', body: JSON.stringify({ value, version: version.current }) })
         version.current = payload.version
       }).catch((error: Error) => {
@@ -421,7 +454,8 @@ function normalizeExpenses(value: unknown): Expense[] {
     const expense = item as Partial<Expense>
     const paidBy = String(expense.paidBy || 'Cash')
     const amount = Math.abs(Number(expense.amount) || 0)
-    return { id: Number(expense.id), date: String(expense.date || ''), category: String(expense.category || ''), description: String(expense.description || ''), amount: paidBy === 'Discount' ? -amount : amount, paidBy }
+    const salaryId = Number(expense.salaryId)
+    return { id: Number(expense.id), date: String(expense.date || ''), category: String(expense.category || ''), description: String(expense.description || ''), amount: paidBy === 'Discount' ? -amount : amount, paidBy, salaryId: Number.isInteger(salaryId) && salaryId > 0 ? salaryId : undefined }
   }).filter((expense) => Number.isFinite(expense.id) && expense.date && Number.isFinite(expense.amount))
 }
 
@@ -500,8 +534,9 @@ export default function App() {
   const [sales, setSales] = useStored<Sale[]>('sales', initialSales, normalizeSales)
   const [customers, setCustomers] = useStored<Customer[]>('customers', initialCustomers, (value) => Array.isArray(value) ? value.map((item) => {
     const legacy = item as Partial<Customer> & { opening?: number }
-    return { id: Number(legacy.id), name: String(legacy.name || ''), phone: String(legacy.phone || ''), address: String(legacy.address || ''), openingBalance: Number(legacy.openingBalance ?? legacy.opening ?? 0) }
+    return { id: Number(legacy.id), name: String(legacy.name || ''), phone: String(legacy.phone || ''), address: String(legacy.address || ''), openingBalance: Number(legacy.openingBalance ?? legacy.opening ?? 0), active: legacy.active !== false }
   }) : initialCustomers)
+  const activeCustomers = customers.filter((customer) => customer.active !== false)
   const [fleetVehicles, setFleetVehicles] = useStored<FleetVehicle[]>('fleet-vehicles', initialFleetVehicles, normalizeFleetVehicles)
   const [fleetAllocations, setFleetAllocations] = useStored<FleetAllocation[]>('fleet-allocations', initialFleetAllocations, normalizeFleetAllocations)
   const [udhar, setUdhar] = useStored<UdharTransaction[]>('udhar-transactions', initialUdhar, normalizeUdharTransactions)
@@ -532,6 +567,9 @@ export default function App() {
   const [fleetCreditVehicleId, setFleetCreditVehicleId] = useState<number>(0)
   const [fleetCreditDraft, setFleetCreditDraft] = useState({ date: today, fuelType: 'HSD', litres: '', rate: '', reference: '', description: '' })
   const [editingFleetCreditEntry, setEditingFleetCreditEntry] = useState<UdharTransaction | null>(null)
+  const [fleetCreditSaving, setFleetCreditSaving] = useState(false)
+  const fleetCreditMutationInFlight = useRef(false)
+  const pendingFleetCreditId = useRef<number | null>(null)
   const [paymentCustomerId, setPaymentCustomerId] = useState(0)
   const [paymentAmount, setPaymentAmount] = useState('')
   const [paymentDate, setPaymentDate] = useState(today)
@@ -715,9 +753,10 @@ export default function App() {
     }
   }
   const deleteCustomer = async (customer: Customer) => {
-    if (!window.confirm(`Delete customer ${customer.name}? Customers with outstanding balances or linked history cannot be deleted.`)) return
+    if (!window.confirm(`Remove customer ${customer.name} from the active customer register? A cleared customer with financial history will be archived so past records remain available.`)) return
     try {
-      await apiRequest(`/api/customers/${encodeURIComponent(String(customer.id))}`, { method: 'DELETE' })
+      const result = await apiRequest<{ archived: boolean }>(`/api/customers/${encodeURIComponent(String(customer.id))}`, { method: 'DELETE' })
+      flash(result.archived ? 'Customer archived and removed from the active register. Historical records were retained.' : 'Customer deleted.')
       window.location.reload()
     } catch (error) {
       flash((error as Error).message)
@@ -819,8 +858,8 @@ export default function App() {
 
   const dashboardRange = useMemo(() => getDashboardDateRange(dashboardPeriod, dashboardCustomFrom, dashboardCustomTo, currentSystemDate), [currentSystemDate, dashboardCustomFrom, dashboardCustomTo, dashboardPeriod])
   const dashboardSummary = useMemo(
-    () => getDashboardSummary({ startDate: dashboardRange.from, endDate: dashboardRange.to, sales: fuelSales, expenses, udhar, otherSales: oilSales, customers, commission: commissionRecords }),
-    [commissionRecords, customers, dashboardRange, expenses, fuelSales, oilSales, udhar],
+    () => getDashboardSummary({ startDate: dashboardRange.from, endDate: dashboardRange.to, sales: fuelSales, expenses, udhar, otherSales: oilSales, salaries: employeeSalaries, customers, commission: commissionRecords }),
+    [commissionRecords, customers, dashboardRange, employeeSalaries, expenses, fuelSales, oilSales, udhar],
   )
   const dailySales = fuelSales.filter((sale) => sale.date === currentSystemDate)
   const dailyExpenses = expenses.filter((expense) => expense.date === currentSystemDate && expense.category !== 'Commission')
@@ -911,14 +950,7 @@ export default function App() {
     return account ? bankAccountLabel(account) : entry.legacyBankName || 'Unlinked bank'
   }
   const vehicleUsageForMonth = (vehicleId: number, companyId: number, month = fleetMonthFilter) => {
-    const vehicle = fleetVehicles.find((item) => item.id === vehicleId && item.customerId === companyId)
-    if (!vehicle) return { limit: 0, used: 0, remaining: 0, usagePercent: 0, status: 'Normal', exceeded: 0, month }
-    const allocation = fleetAllocations.find((entry) => entry.customerId === companyId && entry.vehicleId === vehicleId && entry.month === month)
-    const limit = allocation ? Math.max(0, Number(allocation.monthlyLitresLimit || 0)) : 0
-    const used = udhar
-      .filter((entry) => entry.customerId === companyId && entry.vehicleId === vehicleId && entry.type === 'Credit Sale' && entry.date.startsWith(month) && Number.isFinite(Number(entry.litres || 0)))
-      .reduce((sum, entry) => sum + Math.max(0, Number(entry.litres || 0)), 0)
-    return calculateVehicleUsageSummary({ limit, used, month })
+    return calculateFleetVehicleUsage({ companyId, vehicleId, month, allocations: fleetAllocations, transactions: udhar })
   }
   const selectedCompanyFleet = fleetVehicles.filter((vehicle) => vehicle.customerId === fleetCompanyId && vehicle.status !== 'Inactive')
   const fleetCompanySummary = calculateCompanyFleetSummary({
@@ -926,6 +958,7 @@ export default function App() {
     vehicles: fleetVehicles,
     allocations: fleetAllocations,
     transactions: udhar.filter((entry) => entry.type === 'Credit Sale' && entry.customerId === fleetCompanyId && entry.vehicleId).map((entry) => ({
+      id: entry.id,
       customerId: entry.customerId,
       vehicleId: entry.vehicleId || 0,
       date: entry.date,
@@ -936,12 +969,13 @@ export default function App() {
     })),
     month: fleetMonthFilter,
   })
-  const fleetCompanyRows = customers.map((customer) => {
+  const fleetCompanyRows = activeCustomers.map((customer) => {
     const summary = calculateCompanyFleetSummary({
       companyId: customer.id,
       vehicles: fleetVehicles,
       allocations: fleetAllocations,
       transactions: udhar.filter((entry) => entry.type === 'Credit Sale' && entry.customerId === customer.id && entry.vehicleId).map((entry) => ({
+        id: entry.id,
         customerId: entry.customerId,
         vehicleId: entry.vehicleId || 0,
         date: entry.date,
@@ -1026,7 +1060,7 @@ export default function App() {
     if (selectedTab === 'Customers') return { title: 'Customer Ledger / Customer Statement', period: displayDate(statementDate), headers: ['Date', 'Type', 'Reference', 'Debit', 'Credit', 'Description'], rows: statementEntries.map((entry) => [entry.date, entry.type, entry.reference, printMoney(entry.debit), printMoney(entry.credit), entry.description]), summary: [['Closing Balance', printMoney(statementBalance)]] as [string, string][] }
     if (selectedTab === 'Reports' || selectedTab === 'Accounting') return { title: selectedTab === 'Accounting' ? 'Accounting / Cash Book Report' : 'Monthly Financial & Operations Report', period, headers: ['Ledger', 'Total', 'Notes'], rows: [['Fuel Sales', printMoney(filteredSales.reduce((sum, sale) => sum + sale.amount, 0)), 'Gross fuel revenue'], ['Fuel Purchases', printMoney(filteredPurchases.reduce((sum, purchase) => sum + purchase.amount, 0)), 'Stock procurement'], ['Expenses', printMoney(filteredExpenses.reduce((sum, expense) => sum + expense.amount, 0)), 'Operating costs'], ['Commission', printMoney(commissionAmountForRange), 'Recorded commission expense']] }
     if (selectedTab === 'Daily Operations') return { title: 'Daily Closing Report', period: displayDate(currentSystemDate), headers: ['Metric', 'Value'], rows: [['Fuel Sales', printMoney(dailySales.reduce((sum, sale) => sum + sale.amount, 0))], ['Fuel Litres', `${dailySales.reduce((sum, sale) => sum + sale.litres, 0).toLocaleString()} L`], ['Physical Meter Movement', `${dailyPhysicalMeterMovement.toLocaleString()} L`], ['Meter Test / Calibration', `${dailyTestQuantity.toLocaleString()} L`], ['Actual Meter Customer Movement', `${dailyMeterCustomerMovement.toLocaleString()} L`], ['Non-returned Test Stock Impact', `${dailyNetTestStockImpact.toLocaleString()} L`], ['Customer Udhar Collections', printMoney(dailyCustomerPayments)], ['Expenses', printMoney(dailyExpenses.reduce((sum, expense) => sum + expense.amount, 0))], ['Commission', printMoney(dailyCommission)], ['Net Result', printMoney(dailySales.reduce((sum, sale) => sum + sale.amount, 0) + dailyCustomerPayments - dailyExpenses.reduce((sum, expense) => sum + expense.amount, 0) - dailyCommission)]] }
-    return { title: 'Daily Dashboard Summary', period, headers: ['Metric', 'Value'], rows: [['Fuel Sales', printMoney(dashboardSummary.totalSales)], ['Fuel Litres Sold', `${dashboardSummary.totalFuelLitres.toLocaleString()} L`], ...products.map((product) => [product, printMoney(dashboardSummary.productTotals[product]?.amount || 0)]), ['Expenses', printMoney(dashboardSummary.operatingExpenses)], ['Sales Less Expenses', printMoney(dashboardSummary.netSales)]] }
+    return { title: 'Dashboard Financial Summary', period, headers: ['Metric', 'Value'], rows: [['Actual Sales', printMoney(dashboardSummary.totalSales)], ['Fuel Litres Sold', `${dashboardSummary.totalFuelLitres.toLocaleString()} L`], ...products.map((product) => [product, printMoney(dashboardSummary.productTotals[product]?.amount || 0)]), ['Expenses', printMoney(dashboardSummary.totalExpenses)], ['Salaries Paid', printMoney(dashboardSummary.salariesPaid)], ['Customer Collections', printMoney(dashboardSummary.customerPayments)], ['Current Receivables', printMoney(dashboardSummary.outstandingReceivables)], ['Commission', printMoney(dashboardSummary.commission)], ['Sales Less Expenses', printMoney(dashboardSummary.netSales)]] }
   })()
 
   const saveMeterTest = (event: FormEvent<HTMLFormElement>) => {
@@ -1171,10 +1205,11 @@ export default function App() {
       mode,
       customer: customer?.name || '-',
       customerId: customer?.id,
+      vehicleId: vehicle?.id,
     }
     setSales((current) => [entry, ...current])
     if (mode === 'Credit' && customer) {
-      setUdhar((current) => [{ id: Date.now() + 1, date: entry.date, customerId: customer.id, type: 'Credit Sale', reference: `SALE-${entry.id}`, description: `${entry.product} ${litres.toLocaleString()} litres`, debit: grossAmount, credit: 0, vehicleId: vehicle?.id, fuelType: product, litres }, ...current])
+      setUdhar((current) => [{ id: entry.id, date: entry.date, customerId: customer.id, type: 'Credit Sale', reference: `SALE-${entry.id}`, description: `${entry.product} ${litres.toLocaleString()} litres`, debit: grossAmount, credit: 0, vehicleId: vehicle?.id, fuelType: product, litres }, ...current])
     }
     event.currentTarget.reset()
     setSaleVehicleId(0)
@@ -1185,7 +1220,7 @@ export default function App() {
     event.preventDefault()
     const data = new FormData(event.currentTarget)
     const opening = numberValue(data.get('openingBalance'))
-    const entry: Customer = { id: Date.now(), name: String(data.get('name')), phone: String(data.get('phone')), address: String(data.get('address')), openingBalance: opening }
+    const entry: Customer = { id: Date.now(), name: String(data.get('name')), phone: String(data.get('phone')), address: String(data.get('address')), openingBalance: opening, active: true }
     setCustomers((current) => [entry, ...current])
     if (opening > 0) {
       setUdhar((current) => [{ id: Date.now() + 1, date: String(data.get('date')), customerId: entry.id, type: 'Opening Balance', reference: `OB-${entry.id}`, description: 'Opening balance', debit: opening, credit: 0 }, ...current])
@@ -1238,6 +1273,8 @@ export default function App() {
     if (!fleetCompanyId || !vehicleId) return flash('Select a company and a vehicle before saving the monthly allocation.')
     if (!Number.isFinite(limit) || limit < 0) return flash('Monthly litre limit must be a valid non-negative number.')
     const month = fleetMonthFilter || `${today.slice(0, 7)}`
+    if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) return flash('Select a valid allocation month.')
+    if (!fleetVehicles.some((vehicle) => vehicle.id === vehicleId && vehicle.customerId === fleetCompanyId && vehicle.status !== 'Inactive')) return flash('Select an active vehicle belonging to this company.')
     const existing = fleetAllocations.find((entry) => entry.customerId === fleetCompanyId && entry.vehicleId === vehicleId && entry.month === month)
     const stamp = new Date().toISOString()
     const entry: FleetAllocation = {
@@ -1263,8 +1300,9 @@ export default function App() {
   const selectedFleetCreditHistory = udhar.filter((entry) => entry.customerId === fleetCreditCompanyId && entry.vehicleId === fleetCreditVehicleId && entry.type === 'Credit Sale').sort((a, b) => b.date.localeCompare(a.date) || b.id - a.id)
   const selectedFleetCreditUsageSummary = fleetCreditVehicleId ? vehicleUsageForMonth(fleetCreditVehicleId, fleetCreditCompanyId, fleetCreditMonth) : { limit: 0, used: 0, remaining: 0, usagePercent: 0, status: 'Normal', exceeded: 0, month: fleetCreditMonth }
 
-  const saveFleetCreditEntry = (event: FormEvent<HTMLFormElement>) => {
+  const saveFleetCreditEntry = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
+    if (fleetCreditMutationInFlight.current) return
     const companyId = Number(fleetCreditCompanyId)
     const vehicleId = Number(fleetCreditVehicleId)
     const vehicle = fleetVehicles.find((item) => item.id === vehicleId && item.customerId === companyId)
@@ -1274,14 +1312,29 @@ export default function App() {
     if (!fleetCreditDraft.fuelType) return flash('Select a fuel type.')
     const litres = Number(fleetCreditDraft.litres)
     const rate = Number(fleetCreditDraft.rate)
-    if (!Number.isFinite(litres) || litres <= 0 || !Number.isFinite(rate) || rate < 0) return flash('Litres must be greater than zero and rate must be a valid non-negative number.')
+    if (!fleetCreditDraft.litres.trim() || !fleetCreditDraft.rate.trim()) return flash('Enter both litres and rate.')
     const month = fleetCreditDraft.date.slice(0, 7)
     const allocation = fleetAllocations.find((entry) => entry.customerId === companyId && entry.vehicleId === vehicleId && entry.month === month)
     if (!allocation) return flash(`No monthly fuel allocation exists for this vehicle for ${month}. Please create the monthly allocation first.`)
-    const amount = litres * rate
+    const usage = calculateFleetVehicleUsage({
+      companyId,
+      vehicleId,
+      month,
+      allocations: fleetAllocations,
+      transactions: udhar,
+      excludeTransactionId: editingFleetCreditEntry?.id,
+    })
+    let amount: number
+    try {
+      amount = validateFleetCreditTransaction({ litres, rate, remainingAllowance: usage.remaining })
+    } catch (error) {
+      return flash(error instanceof Error ? error.message : 'Fleet credit transaction is invalid.')
+    }
     const reference = (fleetCreditDraft.reference || editingFleetCreditEntry?.reference || `VEH-${vehicle.vehicleNumber}-${Date.now()}`).trim()
     const description = (fleetCreditDraft.description || editingFleetCreditEntry?.description || `${vehicle.vehicleNumber} ${fleetCreditDraft.fuelType} credit`).trim()
-    const transactionId = editingFleetCreditEntry?.id || Date.now()
+    if (!editingFleetCreditEntry && pendingFleetCreditId.current === null) pendingFleetCreditId.current = Date.now()
+    const transactionId = editingFleetCreditEntry?.id || pendingFleetCreditId.current
+    if (transactionId === null) return flash('Unable to assign an ID to the fleet credit transaction.')
     const saleEntry: Sale = {
       id: transactionId,
       date: fleetCreditDraft.date,
@@ -1309,19 +1362,34 @@ export default function App() {
       litres,
     }
 
-    if (editingFleetCreditEntry) {
-      setSales((current) => current.map((sale) => sale.id === editingFleetCreditEntry.id ? saleEntry : sale))
-      setUdhar((current) => current.map((entry) => entry.id === editingFleetCreditEntry.id ? udharEntry : entry))
+    fleetCreditMutationInFlight.current = true
+    setFleetCreditSaving(true)
+    try {
+      const result = await apiRequest<FleetCreditCommitResponse>('/api/fleet-credit-transactions', {
+        method: 'POST',
+        body: JSON.stringify({ operation: editingFleetCreditEntry ? 'update' : 'create', sale: saleEntry, transaction: udharEntry }),
+      })
+      window.dispatchEvent(new CustomEvent<AtomicRegisterCommit>('ppms-atomic-register-commit', {
+        detail: {
+          registers: {
+            sales: { value: result.sales, version: result.versions.sales },
+            'udhar-transactions': { value: result.transactions, version: result.versions['udhar-transactions'] },
+          },
+        },
+      }))
+      setSales(result.sales)
+      setUdhar(result.transactions)
+      if (!editingFleetCreditEntry) pendingFleetCreditId.current = null
       setEditingFleetCreditEntry(null)
-      flash('Credit fuel entry updated successfully.')
-    } else {
-      setSales((current) => [saleEntry, ...current])
-      setUdhar((current) => [udharEntry, ...current])
-      flash('Credit fuel entry saved successfully.')
+      setFleetCreditDraft({ date: today, fuelType: 'HSD', litres: '', rate: '', reference: '', description: '' })
+      setFleetCreditVehicleId(vehicleId)
+      flash(editingFleetCreditEntry ? 'Credit fuel entry updated successfully.' : 'Credit fuel entry saved successfully.')
+    } catch (error) {
+      flash(error instanceof Error ? error.message : 'Unable to save the fleet credit transaction.')
+    } finally {
+      fleetCreditMutationInFlight.current = false
+      setFleetCreditSaving(false)
     }
-
-    setFleetCreditDraft({ date: today, fuelType: 'HSD', litres: '', rate: '', reference: '', description: '' })
-    setFleetCreditVehicleId(vehicleId)
   }
 
   const editFleetCreditEntry = (entry: UdharTransaction) => {
@@ -1342,10 +1410,29 @@ export default function App() {
 
   const deleteFleetCreditEntry = (entry: UdharTransaction) => {
     if (!window.confirm(`Delete this credit fuel entry of ${printMoney(entry.debit)}? It will remove the vehicle usage and customer receivable effect.`)) return
-    setUdhar((current) => current.filter((item) => item.id !== entry.id))
-    setSales((current) => current.filter((sale) => sale.id !== entry.id))
-    if (editingFleetCreditEntry?.id === entry.id) setEditingFleetCreditEntry(null)
-    flash('Credit fuel entry deleted successfully.')
+    if (fleetCreditMutationInFlight.current) return
+    fleetCreditMutationInFlight.current = true
+    setFleetCreditSaving(true)
+    apiRequest<FleetCreditCommitResponse>(`/api/fleet-credit-transactions/${encodeURIComponent(String(entry.id))}`, { method: 'DELETE' })
+      .then((result) => {
+        window.dispatchEvent(new CustomEvent<AtomicRegisterCommit>('ppms-atomic-register-commit', {
+          detail: {
+            registers: {
+              sales: { value: result.sales, version: result.versions.sales },
+              'udhar-transactions': { value: result.transactions, version: result.versions['udhar-transactions'] },
+            },
+          },
+        }))
+        setSales(result.sales)
+        setUdhar(result.transactions)
+        if (editingFleetCreditEntry?.id === entry.id) setEditingFleetCreditEntry(null)
+        flash('Credit fuel entry deleted successfully.')
+      })
+      .catch((error: Error) => flash(error.message || 'Unable to delete the fleet credit transaction.'))
+      .finally(() => {
+        fleetCreditMutationInFlight.current = false
+        setFleetCreditSaving(false)
+      })
   }
 
   const customerOutstanding = (customerId: number) => customerBalance(customerId, customers, udhar)
@@ -1390,7 +1477,13 @@ export default function App() {
     const paidBy = String(data.get('paidBy'))
     const enteredAmount = numberValue(data.get('amount'))
     if (enteredAmount <= 0) return flash('Expense amount must be greater than zero.')
-    const entry: Expense = { id: Date.now(), date: String(data.get('date')), category: String(data.get('category')), description: String(data.get('description')), amount: paidBy === 'Discount' ? -enteredAmount : enteredAmount, paidBy }
+    const category = String(data.get('category'))
+    const salaryId = Number(String(data.get('salaryId') || '').split(' - ')[0]) || undefined
+    const linkedSalary = salaryId ? employeeSalaries.find((salary) => salary.id === salaryId) : undefined
+    if (salaryId && (category !== 'Salary' || paidBy === 'Discount' || !linkedSalary || linkedSalary.status !== 'Paid')) return flash('Link a salary expense only to a paid salary record.')
+    if (linkedSalary && (linkedSalary.date !== String(data.get('date')) || Math.abs(linkedSalary.net - enteredAmount) > 0.000001)) return flash('A linked salary expense must match the salary payment date and net amount.')
+    if (salaryId && expenses.some((expense) => expense.salaryId === salaryId)) return flash('This salary already has a linked expense.')
+    const entry: Expense = { id: Date.now(), date: String(data.get('date')), category, description: String(data.get('description')), amount: paidBy === 'Discount' ? -enteredAmount : enteredAmount, paidBy, salaryId }
     setExpenses((current) => [entry, ...current])
     event.currentTarget.reset()
     flash(paidBy === 'Discount' ? 'Discount adjustment saved and subtracted from expenses.' : 'Expense saved.')
@@ -1615,16 +1708,18 @@ export default function App() {
       </section>
 
       <section className="dashboard-kpis" aria-label="Period performance">
-        <article className="dashboard-kpi kpi-primary"><span>Fuel Sales</span><strong>{money(dashboardSummary.totalSales)}</strong><small>Selected period</small></article>
-        <article className="dashboard-kpi"><span>Fuel Sold</span><strong>{measurement(dashboardSummary.totalFuelLitres)} L</strong><small>Customer sales volume</small></article>
-        <article className="dashboard-kpi"><span>Expenses</span><strong>{money(dashboardSummary.operatingExpenses)}</strong><small>Including commission</small></article>
+        <article className="dashboard-kpi kpi-primary"><span>Actual Sales</span><strong>{money(dashboardSummary.totalSales)}</strong><small>Fuel and mobile-oil sales in selected period</small></article>
+        <article className="dashboard-kpi"><span>Fuel Litres Sold</span><strong>{measurement(dashboardSummary.totalFuelLitres)} L</strong><small>Actual fuel sales in selected period</small></article>
+        <article className="dashboard-kpi"><span>Expenses</span><strong>{money(dashboardSummary.totalExpenses)}</strong><small>Recorded expenses in selected period</small></article>
         <article className="dashboard-kpi kpi-receivable"><span>Current Receivables</span><strong>{money(dashboardSummary.outstandingReceivables)}</strong><small>Balance as of {dashboardRange.to}</small></article>
       </section>
 
       <section className="dashboard-financial-strip" aria-label="Credit and cash summary">
         <div><span>Credit / Udhar Sales</span><strong>{money(dashboardSummary.creditSales)}</strong></div>
-        <div><span>Customer Payments</span><strong>{money(dashboardSummary.customerPayments)}</strong></div>
-        <div><span>Sales Less Expenses</span><strong>{money(dashboardSummary.netSales)}</strong></div>
+        <div><span>Customer Collections</span><strong>{money(dashboardSummary.customerPayments)}</strong></div>
+        <div><span>Salaries Paid</span><strong>{money(dashboardSummary.salariesPaid)}</strong></div>
+        <div><span>Commission</span><strong>{money(dashboardSummary.commission)}</strong></div>
+        <div><span>Sales Less Expenses</span><strong>{money(dashboardSummary.netSales)}</strong><small>Operational subtotal; excludes inventory COGS</small></div>
       </section>
 
       <section className="dashboard-section dashboard-fuel-performance">
@@ -1691,7 +1786,7 @@ export default function App() {
       <section className="register-section">
         <div className="section-heading"><h3>Fleet Credit Monitoring</h3><span className="form-note">Company → Vehicle → Monthly litre allocation</span></div>
         <div className="form-grid">
-          <label className="form-field"><span>Company</span><select value={fleetCompanyId} onChange={(event) => { const id = Number(event.target.value); setFleetCompanyId(id); const nextVehicle = fleetVehicles.find((vehicle) => vehicle.customerId === id && vehicle.status !== 'Inactive'); setFleetAllocationVehicleId(nextVehicle ? nextVehicle.id : 0) }} required><option value="0">Select company</option>{customers.map((customer) => <option key={customer.id} value={customer.id}>{customer.name}</option>)}</select></label>
+          <label className="form-field"><span>Company</span><select value={fleetCompanyId} onChange={(event) => { const id = Number(event.target.value); setFleetCompanyId(id); const nextVehicle = fleetVehicles.find((vehicle) => vehicle.customerId === id && vehicle.status !== 'Inactive'); setFleetAllocationVehicleId(nextVehicle ? nextVehicle.id : 0) }} required><option value="0">Select company</option>{activeCustomers.map((customer) => <option key={customer.id} value={customer.id}>{customer.name}</option>)}</select></label>
           <label className="form-field"><span>Selected Month</span><input type="month" value={fleetMonthFilter} onChange={(event) => setFleetMonthFilter(event.target.value)} /></label>
         </div>
         <div className="summary-strip">
@@ -1711,7 +1806,7 @@ export default function App() {
             setFleetCreditCompanyId(companyId)
             const nextVehicle = fleetVehicles.find((vehicle) => vehicle.customerId === companyId && vehicle.status !== 'Inactive')
             setFleetCreditVehicleId(nextVehicle ? nextVehicle.id : 0)
-          }} required><option value="0">Select company</option>{customers.map((customer) => <option key={customer.id} value={customer.id}>{customer.name}</option>)}</select></label>
+          }} required><option value="0">Select company</option>{activeCustomers.map((customer) => <option key={customer.id} value={customer.id}>{customer.name}</option>)}</select></label>
           <label className="form-field"><span>Vehicle</span>{fleetCreditCompanyId && fleetCreditVehicleOptions.length ? <select value={fleetCreditVehicleId} onChange={(event) => setFleetCreditVehicleId(Number(event.target.value))}><option value="0">Select vehicle</option>{fleetCreditVehicleOptions.map((vehicle) => <option key={vehicle.id} value={vehicle.id}>{vehicle.vehicleNumber}</option>)}</select> : <input value="No vehicles found for this company. Add a vehicle first." readOnly />}</label>
         </div>
         <form className="entry-form" onSubmit={saveFleetCreditEntry}>
@@ -1726,7 +1821,7 @@ export default function App() {
             <label className="form-field"><span>Description / Note</span><input value={fleetCreditDraft.description} onChange={(event) => setFleetCreditDraft((current) => ({ ...current, description: event.target.value }))} placeholder="Vehicle fuel credit" /></label>
             {fleetCreditVehicle && <label className="form-field"><span>Monthly Allocation</span><input value={`${selectedFleetCreditUsageSummary.limit.toLocaleString()} L / ${selectedFleetCreditUsageSummary.used.toLocaleString()} L used / ${selectedFleetCreditUsageSummary.remaining.toLocaleString()} L remaining`} readOnly /></label>}
           </div>
-          <div className="form-actions"><button className="primary-button" type="submit">{editingFleetCreditEntry ? 'Save Credit Entry' : 'Save Credit Entry'}</button>{editingFleetCreditEntry && <button className="ghost-button" type="button" onClick={() => { setEditingFleetCreditEntry(null); setFleetCreditDraft({ date: today, fuelType: 'HSD', litres: '', rate: '', reference: '', description: '' }) }}>Cancel</button>}</div>
+          <div className="form-actions"><button className="primary-button" type="submit" disabled={fleetCreditSaving}>{fleetCreditSaving ? 'Saving...' : 'Save Credit Entry'}</button>{editingFleetCreditEntry && <button className="ghost-button" type="button" disabled={fleetCreditSaving} onClick={() => { setEditingFleetCreditEntry(null); setFleetCreditDraft({ date: today, fuelType: 'HSD', litres: '', rate: '', reference: '', description: '' }) }}>Cancel</button>}</div>
         </form>
       </section>
       <section className="register-section">
@@ -1745,7 +1840,7 @@ export default function App() {
         <div className="section-heading"><h3>Add / Edit Vehicle</h3></div>
         <form className="entry-form" onSubmit={saveFleetVehicle}>
           <div className="form-grid">
-            <label className="form-field"><span>Company</span><select value={fleetCompanyId} onChange={(event) => setFleetCompanyId(Number(event.target.value))}><option value="0">Select company</option>{customers.map((customer) => <option key={customer.id} value={customer.id}>{customer.name}</option>)}</select></label>
+            <label className="form-field"><span>Company</span><select value={fleetCompanyId} onChange={(event) => setFleetCompanyId(Number(event.target.value))}><option value="0">Select company</option>{activeCustomers.map((customer) => <option key={customer.id} value={customer.id}>{customer.name}</option>)}</select></label>
             <label className="form-field"><span>Vehicle Number</span><input value={fleetVehicleDraft.vehicleNumber} onChange={(event) => setFleetVehicleDraft((current) => ({ ...current, vehicleNumber: event.target.value }))} required /></label>
             <label className="form-field"><span>Vehicle Name / Type</span><input value={fleetVehicleDraft.vehicleName} onChange={(event) => setFleetVehicleDraft((current) => ({ ...current, vehicleName: event.target.value }))} placeholder="Tipper / Van / Car" /></label>
             <label className="form-field"><span>Driver Name</span><input value={fleetVehicleDraft.driverName} onChange={(event) => setFleetVehicleDraft((current) => ({ ...current, driverName: event.target.value }))} /></label>
@@ -1760,7 +1855,7 @@ export default function App() {
         <div className="section-heading"><h3>Monthly Fuel Allocation</h3></div>
         <form className="entry-form" onSubmit={saveFleetAllocation}>
           <div className="form-grid">
-            <label className="form-field"><span>Company</span><select value={fleetCompanyId} onChange={(event) => { const id = Number(event.target.value); setFleetCompanyId(id); const nextVehicle = fleetVehicles.find((vehicle) => vehicle.customerId === id && vehicle.status !== 'Inactive'); setFleetAllocationVehicleId(nextVehicle ? nextVehicle.id : 0) }}><option value="0">Select company</option>{customers.map((customer) => <option key={customer.id} value={customer.id}>{customer.name}</option>)}</select></label>
+            <label className="form-field"><span>Company</span><select value={fleetCompanyId} onChange={(event) => { const id = Number(event.target.value); setFleetCompanyId(id); const nextVehicle = fleetVehicles.find((vehicle) => vehicle.customerId === id && vehicle.status !== 'Inactive'); setFleetAllocationVehicleId(nextVehicle ? nextVehicle.id : 0) }}><option value="0">Select company</option>{activeCustomers.map((customer) => <option key={customer.id} value={customer.id}>{customer.name}</option>)}</select></label>
             <label className="form-field"><span>Vehicle</span><select value={fleetAllocationVehicleId} onChange={(event) => setFleetAllocationVehicleId(Number(event.target.value))}><option value="0">Select vehicle</option>{fleetVehicles.filter((vehicle) => vehicle.customerId === fleetCompanyId && vehicle.status !== 'Inactive').map((vehicle) => <option key={vehicle.id} value={vehicle.id}>{vehicle.vehicleNumber}</option>)}</select></label>
             <label className="form-field"><span>Month</span><input type="month" value={fleetMonthFilter} onChange={(event) => setFleetMonthFilter(event.target.value)} /></label>
             <label className="form-field"><span>Monthly Limit (Litres)</span><input type="number" min="0" step="1" value={fleetAllocationDraft} onChange={(event) => setFleetAllocationDraft(event.target.value)} /></label>
@@ -1783,7 +1878,7 @@ export default function App() {
       <form className="register-section entry-form" onSubmit={saveCustomerPayment}>
         <div className="section-heading"><h3>{editingPayment ? 'Edit Udhar Payment' : 'Receive Udhar Payment'}</h3><span className="form-note">Collection reduces the customer's receivable.</span></div>
         <div className="form-grid">
-          <label className="form-field"><span>Customer</span><select value={paymentCustomerId} onChange={(event) => setPaymentCustomerId(Number(event.target.value))} required><option value="">Select customer</option>{customers.map((customer) => <option key={customer.id} value={customer.id}>{customer.name}</option>)}</select></label>
+          <label className="form-field"><span>Customer</span><select value={paymentCustomerId} onChange={(event) => setPaymentCustomerId(Number(event.target.value))} required><option value="">Select customer</option>{activeCustomers.map((customer) => <option key={customer.id} value={customer.id}>{customer.name}</option>)}</select></label>
           <label className="form-field"><span>Current Outstanding</span><input value={paymentCustomer ? money(paymentOutstanding) : 'Select a customer'} readOnly /></label>
           <label className="form-field"><span>Payment Amount</span><input type="number" min="0.01" step="0.01" value={paymentAmount} onChange={(event) => setPaymentAmount(event.target.value)} required /></label>
           <label className="form-field"><span>Payment Date</span><input type="date" value={paymentDate} onChange={(event) => setPaymentDate(event.target.value)} required /></label>
@@ -1793,11 +1888,11 @@ export default function App() {
         </div>
         <div className="form-actions"><button className="primary-button" type="submit">{editingPayment ? 'Save Payment Changes' : 'Receive Payment'}</button><button className="ghost-button" type="reset" onClick={() => { setPaymentAmount(''); setPaymentReference(''); setEditingPayment(null) }}>Clear</button></div>
       </form>
-      <FormPanel title="Discount Rule Setup" onSubmit={saveDiscountRule} submitLabel="Save Discount"><Field label="Customer" name="customerId" options={customers.map((customer) => `${customer.id} - ${customer.name}`)} required={false} /><Field label="Product" name="product" options={['', 'HSD', 'PMG', 'XTRON']} required={false} /><Field label="Discount Type" name="discountType" options={['percent', 'fixed']} defaultValue="percent" /><Field label="Discount Value" name="discountValue" type="number" defaultValue={2} /><Field label="Effective Date" name="effectiveDate" type="date" defaultValue={today} /><Field label="Status" name="status" options={['Active', 'Inactive']} defaultValue="Active" /><Field label="Description" name="description" defaultValue="Customer discount" /></FormPanel>
+      <FormPanel title="Discount Rule Setup" onSubmit={saveDiscountRule} submitLabel="Save Discount"><Field label="Customer" name="customerId" options={activeCustomers.map((customer) => `${customer.id} - ${customer.name}`)} required={false} /><Field label="Product" name="product" options={['', 'HSD', 'PMG', 'XTRON']} required={false} /><Field label="Discount Type" name="discountType" options={['percent', 'fixed']} defaultValue="percent" /><Field label="Discount Value" name="discountValue" type="number" defaultValue={2} /><Field label="Effective Date" name="effectiveDate" type="date" defaultValue={today} /><Field label="Status" name="status" options={['Active', 'Inactive']} defaultValue="Active" /><Field label="Description" name="description" defaultValue="Customer discount" /></FormPanel>
       <section className="register-section"><div className="section-heading"><h3>Customer Discount Rules</h3></div><DataTable headers={['Customer', 'Product', 'Type', 'Value', 'Status', 'Description']} rows={discountRules.map((rule) => [rule.customerId ? customerName(rule.customerId) : 'General', rule.product || 'All', rule.discountType, rule.discountValue.toString(), rule.status, rule.description])} /></section>
-      <section className="register-section"><div className="section-heading"><h3>Customer Register</h3></div><DataTable headers={['Name', 'Phone', 'Address', 'Opening Balance']} rows={customers.map((customer) => [customer.name, customer.phone, customer.address, money(customer.openingBalance)])} actions={authUser?.role === 'operator' ? undefined : (rowIndex) => <button className="table-action" type="button" onClick={() => deleteCustomer(customers[rowIndex])}>Delete</button>} /></section><section className="register-section"><div className="section-heading"><h3>Customer Statement by Date</h3></div><div className="statement-controls"><label className="form-field"><span>Customer</span><select value={statementCustomerId} onChange={(event) => setStatementCustomerId(Number(event.target.value))}>{customers.map((customer) => <option key={customer.id} value={customer.id}>{customer.name}</option>)}</select></label><label className="form-field"><span>As of</span><input type="date" value={statementDate} onChange={(event) => setStatementDate(event.target.value)} /></label></div><DataTable headers={['Date', 'Type', 'Reference', 'Debit', 'Credit', 'Description']} rows={statementEntries.map((item) => [item.date, item.type, item.reference, money(item.debit), money(item.credit), item.description])} /><div className="summary-strip"><strong>Balance: {money(statementBalance)}</strong></div></section>
-      <section className="register-section"><div className="section-heading"><h3>Customer Register</h3></div><DataTable headers={['Name', 'Phone', 'Address', 'Opening Balance', 'Outstanding']} rows={customers.map((customer) => [customer.name, customer.phone, customer.address, money(customer.openingBalance), money(customerBalance(customer.id, customers, udhar))])} actions={authUser?.role === 'operator' ? undefined : (rowIndex) => <button className="table-action" type="button" onClick={() => deleteCustomer(customers[rowIndex])}>Delete</button>} /></section>
-      <section className="register-section"><div className="section-heading"><h3>Customer Transaction History</h3></div><div className="statement-controls"><label className="form-field"><span>Customer</span><select value={statementCustomerId} onChange={(event) => setStatementCustomerId(Number(event.target.value))}><option value="0">Select customer</option>{customers.map((customer) => <option key={customer.id} value={customer.id}>{customer.name}</option>)}</select></label><label className="form-field"><span>As of</span><input type="date" value={statementDate} onChange={(event) => setStatementDate(event.target.value)} /></label></div>{statementCustomerId > 0 && <div className="summary-strip"><strong>Total Udhar: {money(selectedCustomerEntries.reduce((sum, item) => sum + item.debit, 0))}</strong><strong>Total Paid: {money(selectedCustomerEntries.filter((item) => item.type === 'Payment Received').reduce((sum, item) => sum + item.credit, 0))}</strong><strong>Remaining: {money(customerOutstanding(statementCustomerId))}</strong></div>}<DataTable headers={['Date', 'Type', 'Description', 'Payment Method', 'Debit', 'Credit', 'Balance', 'Action']} rows={selectedCustomerHistory.map(({ entry, balance }) => [entry.date, entry.type, entry.description, entry.paymentMethod || '-', money(entry.debit), money(entry.credit), money(balance), ''])} actions={(rowIndex) => { const item = selectedCustomerHistory[rowIndex]?.entry; return item?.type === 'Payment Received' ? <><button className="table-action" type="button" onClick={() => editCustomerPayment(item)}>Edit</button><button className="table-action danger-link" type="button" onClick={() => deleteCustomerPayment(item)}>Delete</button></> : undefined }} /></section>
+      <section className="register-section"><div className="section-heading"><h3>Customer Register</h3></div><DataTable headers={['Name', 'Phone', 'Address', 'Opening Balance']} rows={activeCustomers.map((customer) => [customer.name, customer.phone, customer.address, money(customer.openingBalance)])} actions={authUser?.role === 'operator' ? undefined : (rowIndex) => <button className="table-action" type="button" onClick={() => deleteCustomer(activeCustomers[rowIndex])}>Remove</button>} /></section><section className="register-section"><div className="section-heading"><h3>Customer Statement by Date</h3></div><div className="statement-controls"><label className="form-field"><span>Customer</span><select value={statementCustomerId} onChange={(event) => setStatementCustomerId(Number(event.target.value))}>{customers.map((customer) => <option key={customer.id} value={customer.id}>{customer.name}{customer.active === false ? ' (Archived)' : ''}</option>)}</select></label><label className="form-field"><span>As of</span><input type="date" value={statementDate} onChange={(event) => setStatementDate(event.target.value)} /></label></div><DataTable headers={['Date', 'Type', 'Reference', 'Debit', 'Credit', 'Description']} rows={statementEntries.map((item) => [item.date, item.type, item.reference, money(item.debit), money(item.credit), item.description])} /><div className="summary-strip"><strong>Balance: {money(statementBalance)}</strong></div></section>
+      <section className="register-section"><div className="section-heading"><h3>Customer Register</h3></div><DataTable headers={['Name', 'Phone', 'Address', 'Opening Balance', 'Outstanding']} rows={activeCustomers.map((customer) => [customer.name, customer.phone, customer.address, money(customer.openingBalance), money(customerBalance(customer.id, customers, udhar))])} actions={authUser?.role === 'operator' ? undefined : (rowIndex) => <button className="table-action" type="button" onClick={() => deleteCustomer(activeCustomers[rowIndex])}>Remove</button>} /></section>
+      <section className="register-section"><div className="section-heading"><h3>Customer Transaction History</h3></div><div className="statement-controls"><label className="form-field"><span>Customer</span><select value={statementCustomerId} onChange={(event) => setStatementCustomerId(Number(event.target.value))}><option value="0">Select customer</option>{customers.map((customer) => <option key={customer.id} value={customer.id}>{customer.name}{customer.active === false ? ' (Archived)' : ''}</option>)}</select></label><label className="form-field"><span>As of</span><input type="date" value={statementDate} onChange={(event) => setStatementDate(event.target.value)} /></label></div>{statementCustomerId > 0 && <div className="summary-strip"><strong>Total Udhar: {money(selectedCustomerEntries.reduce((sum, item) => sum + item.debit, 0))}</strong><strong>Total Paid: {money(selectedCustomerEntries.filter((item) => item.type === 'Payment Received').reduce((sum, item) => sum + item.credit, 0))}</strong><strong>Remaining: {money(customerOutstanding(statementCustomerId))}</strong></div>}<DataTable headers={['Date', 'Type', 'Description', 'Payment Method', 'Debit', 'Credit', 'Balance', 'Action']} rows={selectedCustomerHistory.map(({ entry, balance }) => [entry.date, entry.type, entry.description, entry.paymentMethod || '-', money(entry.debit), money(entry.credit), money(balance), ''])} actions={(rowIndex) => { const item = selectedCustomerHistory[rowIndex]?.entry; return item?.type === 'Payment Received' ? <><button className="table-action" type="button" onClick={() => editCustomerPayment(item)}>Edit</button><button className="table-action danger-link" type="button" onClick={() => deleteCustomerPayment(item)}>Delete</button></> : undefined }} /></section>
     </>
   )
 
@@ -1855,7 +1950,7 @@ export default function App() {
       <section className="register-section"><div className="section-heading"><h3>BRS Detail</h3></div><DataTable headers={['Date', 'Description', 'Type', 'Amount', 'Status']} rows={brsRecords.filter((entry) => entry.date >= reportRange.from && entry.date <= reportRange.to).map((entry) => [entry.date, entry.description, entry.type, money(entry.amount), entry.status])} /></section>
       {authUser?.role === 'admin' && <><FormPanel title="Employee Salary Register" onSubmit={saveEmployeeSalary} submitLabel="Save Salary"><Field label="Payment Date" name="date" type="date" defaultValue={today} /><Field label="Salary Period" name="period" defaultValue={today.slice(0, 7)} /><Field label="Employee Name" name="employee" /><Field label="Gross Salary" name="gross" type="number" defaultValue={0} /><Field label="Deductions / Advance" name="deductions" type="number" defaultValue={0} /><Field label="Paid By" name="paidBy" options={['Cash', 'Bank', 'Card']} defaultValue="Cash" /><Field label="Status" name="status" options={['Paid', 'Pending']} defaultValue="Paid" /><Field label="Notes" name="notes" required={false} /></FormPanel>
       <section className="register-section"><div className="section-heading"><h3>Employee Salary History</h3></div><DataTable headers={['Date', 'Period', 'Employee', 'Gross', 'Deductions', 'Net Paid', 'Paid By', 'Status']} rows={employeeSalaries.filter((salary) => salary.date >= reportRange.from && salary.date <= reportRange.to).map((salary) => [salary.date, salary.period, salary.employee, money(salary.gross), money(salary.deductions), money(salary.net), salary.paidBy, salary.status])} actions={(rowIndex) => <button className="table-action" type="button" onClick={() => { const visibleSalaries = employeeSalaries.filter((salary) => salary.date >= reportRange.from && salary.date <= reportRange.to); setEmployeeSalaries((current) => current.filter((salary) => salary.id !== visibleSalaries[rowIndex].id)) }}>Delete</button>} /></section></>}
-      <FormPanel title="Family Adjustment" onSubmit={saveFamilyAdjustment} submitLabel="Save Adjustment"><Field label="Date" name="date" type="date" defaultValue={today} /><Field label="Customer / Family Account" name="customerId" options={customers.map((customer) => `${customer.id} - ${customer.name}`)} required={false} /><Field label="Amount" name="amount" type="number" defaultValue={0} /><Field label="Adjustment Type" name="adjustmentType" options={['Increase', 'Decrease']} defaultValue="Increase" /><Field label="Status" name="status" options={['Active', 'Inactive']} defaultValue="Active" /><Field label="Description" name="description" defaultValue="Family adjustment" /><Field label="Notes" name="notes" defaultValue="Adjustment note" /></FormPanel><section className="register-section"><div className="section-heading"><h3>Family Adjustment Register</h3></div><DataTable headers={['Date', 'Customer', 'Amount', 'Type', 'Status', 'Description']} rows={familyAdjustments.filter((entry) => entry.date >= reportRange.from && entry.date <= reportRange.to).map((entry) => [entry.date, entry.customerId ? customerName(entry.customerId) : 'General', money(entry.amount), entry.adjustmentType, entry.status, entry.description])} actions={(rowIndex) => <button className="table-action" type="button" onClick={() => setFamilyAdjustments((current) => current.filter((entry) => entry.id !== familyAdjustments.filter((item) => item.date >= reportRange.from && item.date <= reportRange.to)[rowIndex].id))}>Delete</button>} /></section>
+      <FormPanel title="Family Adjustment" onSubmit={saveFamilyAdjustment} submitLabel="Save Adjustment"><Field label="Date" name="date" type="date" defaultValue={today} /><Field label="Customer / Family Account" name="customerId" options={activeCustomers.map((customer) => `${customer.id} - ${customer.name}`)} required={false} /><Field label="Amount" name="amount" type="number" defaultValue={0} /><Field label="Adjustment Type" name="adjustmentType" options={['Increase', 'Decrease']} defaultValue="Increase" /><Field label="Status" name="status" options={['Active', 'Inactive']} defaultValue="Active" /><Field label="Description" name="description" defaultValue="Family adjustment" /><Field label="Notes" name="notes" defaultValue="Adjustment note" /></FormPanel><section className="register-section"><div className="section-heading"><h3>Family Adjustment Register</h3></div><DataTable headers={['Date', 'Customer', 'Amount', 'Type', 'Status', 'Description']} rows={familyAdjustments.filter((entry) => entry.date >= reportRange.from && entry.date <= reportRange.to).map((entry) => [entry.date, entry.customerId ? customerName(entry.customerId) : 'General', money(entry.amount), entry.adjustmentType, entry.status, entry.description])} actions={(rowIndex) => <button className="table-action" type="button" onClick={() => setFamilyAdjustments((current) => current.filter((entry) => entry.id !== familyAdjustments.filter((item) => item.date >= reportRange.from && item.date <= reportRange.to)[rowIndex].id))}>Delete</button>} /></section>
     </>
   )
 
@@ -1877,9 +1972,9 @@ export default function App() {
               <label className="form-field"><span>Fuel Type</span><select value={meterDraft.product} onChange={(event) => { const product = event.target.value as Product; setMeterDraft((current) => ({ ...current, product, nozzle: productNozzles[product][0], previous: '' })) }} required>{products.map((product) => <option key={product} value={product}>{product}</option>)}</select></label>
               <label className="form-field"><span>Nozzle Number / ID</span><select value={meterDraft.nozzle} onChange={(event) => setMeterDraft((current) => ({ ...current, nozzle: event.target.value, previous: '' }))} required>{productNozzles[meterDraft.product].map((nozzle) => <option key={nozzle} value={nozzle}>{nozzle}</option>)}</select></label>
               <label className="form-field"><span>Opening Meter Reading</span><input type="number" min="0" step="any" value={previousMeterReading ? String(previousMeterReading.present) : meterDraft.previous} onChange={(event) => setMeterDraft((current) => ({ ...current, previous: event.target.value }))} readOnly={Boolean(previousMeterReading)} required /><small className="form-note">{previousMeterReading ? 'Automatically taken from the previous closing reading for this nozzle.' : 'First reading for this nozzle. Enter the opening meter manually.'}</small></label>
-              <label className="form-field"><span>Closing Meter Reading</span><input type="number" min="0" step="any" value={meterDraft.present} onChange={(event) => setMeterDraft((current) => ({ ...current, present: event.target.value }))} required /></label>
+              <label className="form-field"><span>Closing Meter Reading</span><input type="text" inputMode="decimal" autoComplete="off" name="closingReading" value={meterDraft.present} onChange={(event) => setMeterDraft((current) => ({ ...current, present: event.target.value }))} required /></label>
               <label className="form-field"><span>Litres</span><input value={meterDraftLitres ? measurement(meterDraftLitres) : '0.00'} readOnly /></label>
-              <label className="form-field"><span>Rate per Litre</span><input type="number" min="0" step="any" value={meterDraft.rate} onChange={(event) => setMeterDraft((current) => ({ ...current, rate: event.target.value }))} required /></label>
+              <label className="form-field"><span>Rate per Litre</span><input type="text" inputMode="decimal" autoComplete="off" name="ratePerLitre" value={meterDraft.rate} onChange={(event) => setMeterDraft((current) => ({ ...current, rate: event.target.value }))} required /></label>
               <label className="form-field"><span>Amount</span><input value={printMoney(meterDraftAmount)} readOnly /></label>
             </div>
             <div className="form-actions"><button className="primary-button" type="submit">{editingMeter ? 'Save Changes' : 'Save Entry'}</button><button className="ghost-button" type="reset">Clear</button></div>
@@ -1912,18 +2007,99 @@ export default function App() {
     ) :
     selectedTab === 'Sales' ? (
       <>
-        <FormPanel title="Fuel Sale / Daily Sales Register" onSubmit={saveSale}><Field label="Date" name="date" type="date" defaultValue={today} /><Field label="Product" name="product" options={products} defaultValue="HSD" /><Field label="Litres" name="litres" type="number" defaultValue={100} /><Field label="Sale Rate" name="rate" type="number" defaultValue={285} /><Field label="Payment Mode" name="mode" options={['Cash', 'Credit', 'Bank']} defaultValue="Cash" /><Field label="Payment Method" name="paymentMethod" options={['Cash', 'Card', 'Credit Card', 'Debit Card', 'Bank Transfer', 'Online Payment', 'Other']} defaultValue="Cash" /><Field label="Customer for Credit Sale" name="customerId" options={customers.map((customer) => `${customer.id} - ${customer.name}`)} required={false} /></FormPanel>
+        <FormPanel title="Fuel Sale / Daily Sales Register" onSubmit={saveSale}><Field label="Date" name="date" type="date" defaultValue={today} /><Field label="Product" name="product" options={products} defaultValue="HSD" /><Field label="Litres" name="litres" type="number" defaultValue={100} /><Field label="Sale Rate" name="rate" type="number" defaultValue={285} /><Field label="Payment Mode" name="mode" options={['Cash', 'Credit', 'Bank']} defaultValue="Cash" /><Field label="Payment Method" name="paymentMethod" options={['Cash', 'Card', 'Credit Card', 'Debit Card', 'Bank Transfer', 'Online Payment', 'Other']} defaultValue="Cash" /><Field label="Customer for Credit Sale" name="customerId" options={activeCustomers.map((customer) => `${customer.id} - ${customer.name}`)} required={false} /></FormPanel>
         <section className="register-section"><div className="section-heading"><h3>Fuel Sales Register</h3><input className="table-search" aria-label="Search fuel sales" value={recordSearch} onChange={(event) => setRecordSearch(event.target.value)} placeholder="Search sales" /></div><DataTable headers={['Date', 'Product', 'Litres', 'Rate', 'Amount', 'Mode', 'Customer']} rows={visibleSales.map((sale) => [sale.date, sale.product, sale.litres, money(sale.rate), money(sale.amount), sale.mode, sale.customer])} actions={authUser?.role === 'operator' ? undefined : (rowIndex) => <button className="table-action" type="button" onClick={() => deleteSale(visibleSales[rowIndex])}>Delete</button>} /></section>
       </>
     ) :
     selectedTab === 'Expenses' ? (
       <>
-        <FormPanel title="Expense Register" onSubmit={saveExpense}><Field label="Date" name="date" type="date" defaultValue={today} /><Field label="Category" name="category" options={['Commission', 'Salary', 'Electricity', 'Maintenance', 'Pump Expenses', 'Miscellaneous']} defaultValue="Pump Expenses" /><Field label="Description" name="description" /><Field label="Amount" name="amount" type="number" min="0.01" step="0.01" defaultValue={0} /><Field label="Paid By" name="paidBy" options={['Cash', 'Bank', 'Card', 'Credit', 'Recived Amount']} defaultValue="Cash" /></FormPanel>
+        <FormPanel title="Expense Register" onSubmit={saveExpense}><Field label="Date" name="date" type="date" defaultValue={today} /><Field label="Category" name="category" options={['Commission', 'Salary', 'Electricity', 'Maintenance', 'Pump Expenses', 'Miscellaneous']} defaultValue="Pump Expenses" /><Field label="Linked Paid Salary (optional)" name="salaryId" options={employeeSalaries.filter((salary) => salary.status === 'Paid').map((salary) => `${salary.id} - ${salary.employee} - ${salary.date}`)} required={false} /><Field label="Description" name="description" /><Field label="Amount" name="amount" type="number" min="0.01" step="0.01" defaultValue={0} /><Field label="Paid By" name="paidBy" options={['Cash', 'Bank', 'Card', 'Credit', 'Recived Amount']} defaultValue="Cash" /></FormPanel>
         <section className="register-section"><div className="section-heading"><h3>Expense Summary</h3><input className="table-search" aria-label="Search expenses" value={recordSearch} onChange={(event) => setRecordSearch(event.target.value)} placeholder="Search expenses" /></div><DataTable headers={['Date', 'Category', 'Description', 'Amount', 'Paid By']} rows={visibleExpenses.map((expense) => [expense.date, expense.category, expense.description, money(expense.amount), expense.paidBy])} actions={(rowIndex) => <button className="table-action" type="button" onClick={() => setExpenses((current) => current.filter((expense) => expense.id !== visibleExpenses[rowIndex].id))}>Delete</button>} /></section>
       </>
     ) :
     selectedTab === 'Daily Operations' ? (
-      <section className="register-section module-placeholder"><h3>Daily Closing & Shift Handover</h3><p>Review the active sales, expenses, meters, and customer balances before closing the shift.</p><div className="summary-strip"><strong>Fuel Sales: {money(dailySales.reduce((sum, sale) => sum + sale.amount, 0))}</strong><strong>Fuel Litres: {dailySales.reduce((sum, sale) => sum + sale.litres, 0).toLocaleString()} L</strong><strong>Physical Meter Movement: {dailyPhysicalMeterMovement.toLocaleString()} L</strong><strong>Meter Test / Calibration: {dailyTestQuantity.toLocaleString()} L</strong><strong>Actual Meter Customer Movement: {dailyMeterCustomerMovement.toLocaleString()} L</strong><strong>Non-returned Test Stock Impact: {dailyNetTestStockImpact.toLocaleString()} L</strong><strong>Cash Sale: {money(dailySales.filter((sale) => sale.mode === 'Cash').reduce((sum, sale) => sum + sale.amount, 0))}</strong><strong>Customer Collections: {money(dailyCustomerPayments)}</strong><strong>Expenses: {money(dailyExpenses.reduce((sum, expense) => sum + expense.amount, 0))}</strong><strong>Commission: {money(dailyCommission)}</strong><strong>Net Result: {money(dailySales.reduce((sum, sale) => sum + sale.amount, 0) + dailyCustomerPayments - dailyExpenses.reduce((sum, expense) => sum + expense.amount, 0) - dailyCommission)}</strong><button className="primary-button" type="button" onClick={() => printDocument('Daily Closing Report', displayDate(currentSystemDate))}>Print Daily Closing</button></div></section>
+      <div className="daily-operations">
+        <section className="daily-kpi-grid" aria-label="Daily operations summary">
+          <article className="daily-kpi-card daily-kpi-card--sales">
+            <div className="daily-kpi-label"><span className="daily-kpi-accent" aria-hidden="true" /><span>Fuel Sales</span></div>
+            <strong>{money(dailySales.reduce((sum, sale) => sum + sale.amount, 0))}</strong>
+            <small>Recorded today</small>
+          </article>
+          <article className="daily-kpi-card daily-kpi-card--litres">
+            <div className="daily-kpi-label"><span className="daily-kpi-accent" aria-hidden="true" /><span>Fuel Litres Sold</span></div>
+            <strong>{measurement(dailySales.reduce((sum, sale) => sum + sale.litres, 0))} <small>L</small></strong>
+            <small>Recorded today</small>
+          </article>
+          <article className="daily-kpi-card daily-kpi-card--cash">
+            <div className="daily-kpi-label"><span className="daily-kpi-accent" aria-hidden="true" /><span>Cash Sales</span></div>
+            <strong>{money(dailySales.filter((sale) => sale.mode === 'Cash').reduce((sum, sale) => sum + sale.amount, 0))}</strong>
+            <small>Cash-mode fuel sales</small>
+          </article>
+          <article className="daily-kpi-card daily-kpi-card--collections">
+            <div className="daily-kpi-label"><span className="daily-kpi-accent" aria-hidden="true" /><span>Customer Collections</span></div>
+            <strong>{money(dailyCustomerPayments)}</strong>
+            <small>Payments received today</small>
+          </article>
+          <article className="daily-kpi-card daily-kpi-card--expenses">
+            <div className="daily-kpi-label"><span className="daily-kpi-accent" aria-hidden="true" /><span>Expenses</span></div>
+            <strong>{money(dailyExpenses.reduce((sum, expense) => sum + expense.amount, 0))}</strong>
+            <small>Recorded today</small>
+          </article>
+          <article className="daily-kpi-card daily-kpi-card--commission">
+            <div className="daily-kpi-label"><span className="daily-kpi-accent" aria-hidden="true" /><span>Commission</span></div>
+            <strong>{money(dailyCommission)}</strong>
+            <small>Recorded today</small>
+          </article>
+        </section>
+
+        <section className="daily-section daily-meter-section" aria-labelledby="daily-meter-heading">
+          <div className="daily-section-heading">
+            <div>
+              <p className="daily-section-eyebrow">Movement reconciliation</p>
+              <h3 id="daily-meter-heading">Meter &amp; Calibration</h3>
+              <p>Compare physical nozzle movement with customer movement and test stock impact.</p>
+            </div>
+            <span className="daily-date-chip">{displayDate(currentSystemDate)}</span>
+          </div>
+          <div className="daily-meter-grid">
+            <article className="daily-meter-stat">
+              <span>Physical Meter Movement</span>
+              <strong>{measurement(dailyPhysicalMeterMovement)} <small>L</small></strong>
+            </article>
+            <article className="daily-meter-stat">
+              <span>Meter Test / Calibration</span>
+              <strong>{measurement(dailyTestQuantity)} <small>L</small></strong>
+            </article>
+            <article className="daily-meter-stat daily-meter-stat--highlight">
+              <span>Actual Meter Customer Movement</span>
+              <strong>{measurement(dailyMeterCustomerMovement)} <small>L</small></strong>
+            </article>
+            <article className="daily-meter-stat">
+              <span>Non-returned Test Stock Impact</span>
+              <strong>{measurement(dailyNetTestStockImpact)} <small>L</small></strong>
+            </article>
+          </div>
+        </section>
+
+        <section className="daily-section daily-closing-section" aria-labelledby="daily-closing-heading">
+          <div className="daily-closing-copy">
+            <p className="daily-section-eyebrow">End-of-shift review</p>
+            <h3 id="daily-closing-heading">Daily Closing &amp; Shift Handover</h3>
+            <p>Review today’s activity and prepare a closing report for the next shift.</p>
+          </div>
+          <dl className="daily-closing-summary">
+            <div><dt>Fuel Sales</dt><dd>{money(dailySales.reduce((sum, sale) => sum + sale.amount, 0))}</dd></div>
+            <div><dt>Customer Collections</dt><dd>{money(dailyCustomerPayments)}</dd></div>
+            <div><dt>Expenses</dt><dd>{money(dailyExpenses.reduce((sum, expense) => sum + expense.amount, 0))}</dd></div>
+            <div><dt>Commission</dt><dd>{money(dailyCommission)}</dd></div>
+            <div className="daily-closing-total"><dt>Net Result</dt><dd>{money(dailySales.reduce((sum, sale) => sum + sale.amount, 0) + dailyCustomerPayments - dailyExpenses.reduce((sum, expense) => sum + expense.amount, 0) - dailyCommission)}</dd></div>
+          </dl>
+          <div className="daily-closing-actions">
+            <span>Closing report for {displayDate(currentSystemDate)}</span>
+            <button className="primary-button" type="button" onClick={() => printDocument('Daily Closing Report', displayDate(currentSystemDate))}>Print Daily Closing</button>
+          </div>
+        </section>
+      </div>
     ) :
     selectedTab === 'Mobile Oil' ? (
       <>
@@ -2038,7 +2214,7 @@ export default function App() {
         </aside>
         <main key={selectedTab} className="main-panel">
           <header className="topbar">
-            <div className="topbar-heading"><button type="button" className="mobile-menu-button" aria-label="Open navigation menu" aria-expanded={mobileMenuOpen} onClick={() => setMobileMenuOpen((open) => !open)}>Menu</button><div><p className="eyebrow">EKHWAN - 1 <span>/</span> {selectedTab === 'Customers' ? 'Companies & Customers' : selectedTab}</p><h2>{selectedTab === 'Dashboard' ? 'Dashboard' : selectedTab}</h2><p className="topbar-subtitle">{selectedTab === 'Dashboard' ? 'Station operations overview' : 'Petrol Pump Management System'}</p></div></div>
+            <div className="topbar-heading"><button type="button" className="mobile-menu-button" aria-label="Open navigation menu" aria-expanded={mobileMenuOpen} onClick={() => setMobileMenuOpen((open) => !open)}>Menu</button><div><p className="eyebrow">EKHWAN - 1 <span>/</span> {selectedTab === 'Customers' ? 'Companies & Customers' : selectedTab}</p><h2>{selectedTab === 'Dashboard' ? 'Dashboard' : selectedTab}</h2><p className="topbar-subtitle">{selectedTab === 'Dashboard' ? 'Station operations overview' : selectedTab === 'Daily Operations' ? 'Monitor fuel movement, cash activity, and shift closing' : 'Petrol Pump Management System'}</p></div></div>
             <div className="topbar-actions"><span className={`topbar-system-state${systemStatus?.databaseExists === false ? ' offline' : ''}`}><span className="status-dot" />{systemStatus?.databaseExists ? 'Local database ready' : systemStatus ? 'Database unavailable' : 'Local system'}</span><button type="button" className="ghost-button" onClick={() => go('Daily Operations')}>Daily Closing</button><button type="button" className="primary-button" onClick={() => printDocument(selectedTab === 'Dashboard' ? 'Daily Dashboard Summary' : `${selectedTab} Report`)}>Print Report</button><div className="topbar-user"><span className="user-avatar">{authUser.username.slice(0, 2).toUpperCase()}</span><div><strong>{authUser.username}</strong><small>{authUser.role}</small></div></div></div>
           </header>
           {notice && <div className="toast" role="alert" aria-live="assertive">{notice}</div>}

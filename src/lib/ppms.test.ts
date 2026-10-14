@@ -13,6 +13,8 @@ import {
   getCommissionTotal,
   calculateVehicleUsageSummary,
   calculateCompanyFleetSummary,
+  calculateFleetVehicleUsage,
+  validateFleetCreditTransaction,
   getDashboardDateRange,
   findPreviousMeterReading,
   recalculateMeterReadingChain,
@@ -247,7 +249,8 @@ describe('petrol pump accounting logic', () => {
       customers: [{ id: 8, openingBalance: 500 }],
     })
 
-    expect(summary.totalSales).toBeCloseTo(1652.95)
+    expect(summary.totalSales).toBeCloseTo(1702.95)
+    expect(summary.totalFuelSales).toBeCloseTo(1652.95)
     expect(summary.totalFuelLitres).toBe(5)
     expect(summary.productTotals.HSD).toEqual({ litres: 5, amount: 1652.95 })
     expect(summary.productTotals.PMG).toEqual({ litres: 0, amount: 0 })
@@ -488,5 +491,125 @@ describe('petrol pump accounting logic', () => {
     expect(summary.totalRemaining).toBe(750)
     expect(summary.usagePercent).toBeCloseTo(37.5, 5)
     expect(summary.overLimitVehicles).toBe(0)
+  })
+
+  it('keeps monthly fleet allocations separate from sales and fuel sold', () => {
+    const vehicles = [
+      { id: 1, customerId: 8, vehicleNumber: 'CAR-A' },
+      { id: 2, customerId: 8, vehicleNumber: 'CAR-B' },
+    ]
+    const allocations = [
+      { customerId: 8, vehicleId: 1, month: '2026-10', monthlyLitresLimit: 500 },
+      { customerId: 8, vehicleId: 2, month: '2026-10', monthlyLitresLimit: 500 },
+    ]
+    const fleet = calculateCompanyFleetSummary({ companyId: 8, vehicles, allocations, transactions: [], month: '2026-10' })
+    const dashboard = getDashboardSummary({ startDate: '2026-10-01', endDate: '2026-10-31', sales: [], expenses: [], udhar: [] })
+
+    expect(fleet.totalAllocation).toBe(1000)
+    expect(fleet.totalUsed).toBe(0)
+    expect(dashboard.totalSales).toBe(0)
+    expect(dashboard.totalFuelLitres).toBe(0)
+  })
+
+  it('records fleet credit sale once while reducing only that vehicle allowance and increasing receivables', () => {
+    const allocations = [
+      { customerId: 8, vehicleId: 1, month: '2026-10', monthlyLitresLimit: 500 },
+      { customerId: 8, vehicleId: 2, month: '2026-10', monthlyLitresLimit: 500 },
+    ]
+    const transaction = { id: 100, customerId: 8, vehicleId: 1, date: '2026-10-05', type: 'Credit Sale', litres: 20, debit: 6000, credit: 0 }
+    const usageA = calculateFleetVehicleUsage({ companyId: 8, vehicleId: 1, month: '2026-10', allocations, transactions: [transaction] })
+    const usageB = calculateFleetVehicleUsage({ companyId: 8, vehicleId: 2, month: '2026-10', allocations, transactions: [transaction] })
+    const sale = { id: 100, date: transaction.date, product: 'HSD', litres: 20, rate: 300, amount: 6000, mode: 'Credit', customer: 'asdf', customerId: 8, vehicleId: 1 }
+    const dashboard = getDashboardSummary({
+      startDate: '2026-10-01',
+      endDate: '2026-10-31',
+      sales: [sale, sale],
+      expenses: [],
+      udhar: [{ ...transaction, reference: 'INV-100', description: 'HSD fleet credit' }],
+      customers: [{ id: 8, openingBalance: 0 }],
+    })
+
+    expect(usageA.remaining).toBe(480)
+    expect(usageB.remaining).toBe(500)
+    expect(dashboard.totalSales).toBe(6000)
+    expect(dashboard.totalFuelLitres).toBe(20)
+    expect(dashboard.outstandingReceivables).toBe(6000)
+  })
+
+  it('counts a customer payment as collections and reduces receivables without adding sales', () => {
+    const dashboard = getDashboardSummary({
+      startDate: '2026-10-01',
+      endDate: '2026-10-10',
+      sales: [{ id: 100, date: '2026-10-05', product: 'HSD', litres: 20, rate: 300, amount: 6000, mode: 'Credit', customer: 'asdf', customerId: 8 }],
+      expenses: [],
+      udhar: [
+        { id: 100, date: '2026-10-05', customerId: 8, type: 'Credit Sale', reference: 'INV-100', description: '', debit: 6000, credit: 0 },
+        { id: 101, date: '2026-10-08', customerId: 8, type: 'Payment Received', reference: 'RCV-101', description: '', debit: 0, credit: 1500 },
+      ],
+      customers: [{ id: 8, openingBalance: 0 }],
+    })
+
+    expect(dashboard.totalSales).toBe(6000)
+    expect(dashboard.customerPayments).toBe(1500)
+    expect(dashboard.outstandingReceivables).toBe(4500)
+  })
+
+  it('accumulates fleet transactions per vehicle and calendar month without carrying usage forward', () => {
+    const allocations = [
+      { customerId: 8, vehicleId: 1, month: '2026-10', monthlyLitresLimit: 500 },
+      { customerId: 8, vehicleId: 1, month: '2026-11', monthlyLitresLimit: 500 },
+      { customerId: 8, vehicleId: 2, month: '2026-10', monthlyLitresLimit: 500 },
+    ]
+    const transactions = [
+      { id: 1, customerId: 8, vehicleId: 1, date: '2026-10-02', type: 'Credit Sale', litres: 20 },
+      { id: 2, customerId: 8, vehicleId: 1, date: '2026-10-15', type: 'Credit Sale', litres: 30 },
+      { id: 3, customerId: 8, vehicleId: 2, date: '2026-10-15', type: 'Credit Sale', litres: 40 },
+      { id: 4, customerId: 8, vehicleId: 1, date: '2026-11-01', type: 'Credit Sale', litres: 50 },
+    ]
+
+    expect(calculateFleetVehicleUsage({ companyId: 8, vehicleId: 1, month: '2026-10', allocations, transactions }).used).toBe(50)
+    expect(calculateFleetVehicleUsage({ companyId: 8, vehicleId: 2, month: '2026-10', allocations, transactions }).remaining).toBe(460)
+    expect(calculateFleetVehicleUsage({ companyId: 8, vehicleId: 1, month: '2026-11', allocations, transactions }).remaining).toBe(450)
+  })
+
+  it('rejects over-limit, invalid-litre, invalid-rate, and overflowing fleet transactions', () => {
+    expect(validateFleetCreditTransaction({ litres: 20, rate: 300, remainingAllowance: 500 })).toBe(6000)
+    expect(() => validateFleetCreditTransaction({ litres: 21, rate: 300, remainingAllowance: 20 })).toThrow('exceeds the vehicle')
+    expect(() => validateFleetCreditTransaction({ litres: -1, rate: 300, remainingAllowance: 500 })).toThrow('Litres must')
+    expect(() => validateFleetCreditTransaction({ litres: Number.NaN, rate: 300, remainingAllowance: 500 })).toThrow('Litres must')
+    expect(() => validateFleetCreditTransaction({ litres: 10, rate: -1, remainingAllowance: 500 })).toThrow('Rate must')
+    expect(() => validateFleetCreditTransaction({ litres: Number.MAX_VALUE, rate: 2, remainingAllowance: Number.MAX_VALUE })).toThrow('amount')
+  })
+
+  it('recalculates a fleet allowance exactly once after editing or deleting its linked credit transaction', () => {
+    const allocations = [{ customerId: 8, vehicleId: 1, month: '2026-10', monthlyLitresLimit: 500 }]
+    const existing = { id: 100, customerId: 8, vehicleId: 1, date: '2026-10-05', type: 'Credit Sale', litres: 20 }
+    const beforeEdit = calculateFleetVehicleUsage({ companyId: 8, vehicleId: 1, month: '2026-10', allocations, transactions: [existing] })
+    const allowanceWithoutEditedRecord = calculateFleetVehicleUsage({ companyId: 8, vehicleId: 1, month: '2026-10', allocations, transactions: [existing], excludeTransactionId: existing.id })
+    const edited = { ...existing, litres: 25 }
+    const afterEdit = calculateFleetVehicleUsage({ companyId: 8, vehicleId: 1, month: '2026-10', allocations, transactions: [edited] })
+    const afterDelete = calculateFleetVehicleUsage({ companyId: 8, vehicleId: 1, month: '2026-10', allocations, transactions: [] })
+
+    expect(beforeEdit.remaining).toBe(480)
+    expect(allowanceWithoutEditedRecord.remaining).toBe(500)
+    expect(validateFleetCreditTransaction({ litres: 25, rate: 300, remainingAllowance: allowanceWithoutEditedRecord.remaining })).toBe(7500)
+    expect(afterEdit.remaining).toBe(475)
+    expect(afterDelete.remaining).toBe(500)
+  })
+
+  it('counts paid salary once when a matching Salary expense is linked', () => {
+    const dashboard = getDashboardSummary({
+      startDate: '2026-10-01',
+      endDate: '2026-10-31',
+      sales: [{ id: 1, date: '2026-10-10', product: 'HSD', litres: 10, rate: 300, amount: 3000, mode: 'Cash', customer: '-' }],
+      expenses: [{ id: 9, date: '2026-10-12', category: 'Salary', description: 'Payroll', amount: 1000, paidBy: 'Cash', salaryId: 7 }],
+      salaries: [{ id: 7, date: '2026-10-12', net: 1000, status: 'Paid' }, { id: 8, date: '2026-10-12', net: 500, status: 'Pending' }],
+      udhar: [],
+    })
+
+    expect(dashboard.salariesPaid).toBe(1000)
+    expect(dashboard.totalExpenses).toBe(1000)
+    expect(dashboard.salariesNotIncludedInExpenses).toBe(0)
+    expect(dashboard.netSales).toBe(2000)
   })
 })

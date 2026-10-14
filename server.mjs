@@ -306,6 +306,180 @@ function writeRegisterValues(user, values, clearUnknownKeys = false) {
   }
 }
 
+function sameFleetCreditPair(sale, transaction) {
+  return sale && transaction &&
+    String(sale.id) === String(transaction.id) &&
+    sale.mode === 'Credit' &&
+    transaction.type === 'Credit Sale' &&
+    String(sale.customerId) === String(transaction.customerId) &&
+    String(sale.vehicleId) === String(transaction.vehicleId) &&
+    sale.date === transaction.date &&
+    sale.litres === transaction.litres &&
+    sale.amount === transaction.debit &&
+    sale.reference === transaction.reference &&
+    transaction.fuelType === sale.product &&
+    transaction.credit === 0
+}
+
+function fleetCreditRecordMatches(existing, expected, fields) {
+  return fields.every((field) => existing?.[field] === expected?.[field])
+}
+
+function validateFleetCreditPair(sale, transaction, allocations, vehicles, customers, transactions, excludeId = null) {
+  if (!sale || typeof sale !== 'object' || !transaction || typeof transaction !== 'object') return 'Sale and receivable records are required.'
+  if (!Number.isSafeInteger(sale.id) || !Number.isSafeInteger(transaction.id) || sale.id !== transaction.id) return 'A matching numeric transaction ID is required.'
+  const timestamp = typeof sale.date === 'string' ? Date.parse(`${sale.date}T00:00:00Z`) : Number.NaN
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(sale.date) || !Number.isFinite(timestamp) ||
+    new Date(timestamp).toISOString().slice(0, 10) !== sale.date || sale.date !== transaction.date) return 'A matching valid transaction date is required.'
+  if (!['HSD', 'PMG', 'XTRON'].includes(sale.product) || transaction.fuelType !== sale.product) return 'A matching valid fuel type is required.'
+  if (sale.mode !== 'Credit' || transaction.type !== 'Credit Sale') return 'Fleet credit entries must be credit sales.'
+  if (!Number.isSafeInteger(sale.customerId) || !Number.isSafeInteger(sale.vehicleId) ||
+    sale.customerId !== transaction.customerId || sale.vehicleId !== transaction.vehicleId) return 'Sale and receivable must reference the same company and vehicle.'
+  if (!Number.isFinite(sale.litres) || sale.litres <= 0 || transaction.litres !== sale.litres) return 'Litres must be a valid positive number.'
+  if (!Number.isFinite(sale.rate) || sale.rate < 0) return 'Rate must be a valid non-negative number.'
+  if (!Number.isFinite(sale.amount) || sale.amount <= 0 || Math.abs(sale.amount - sale.litres * sale.rate) > 0.01 ||
+    transaction.debit !== sale.amount || transaction.credit !== 0) return 'Sale amount and receivable amount must match the litres and rate.'
+  if (typeof sale.reference !== 'string' || sale.reference !== transaction.reference ||
+    typeof transaction.description !== 'string') return 'Sale and receivable references must match.'
+
+  const vehicle = Array.isArray(vehicles) && vehicles.find((item) => item.id === sale.vehicleId && item.customerId === sale.customerId && item.status !== 'Inactive')
+  if (!vehicle) return 'The selected active vehicle does not belong to this company.'
+  if (!Array.isArray(customers) || !customers.some((customer) => customer.id === sale.customerId)) return 'The selected company could not be found.'
+  const month = sale.date.slice(0, 7)
+  const allocation = Array.isArray(allocations) && allocations.find((item) =>
+    item.customerId === sale.customerId && item.vehicleId === sale.vehicleId && item.month === month)
+  if (!allocation || !Number.isFinite(allocation.monthlyLitresLimit) || allocation.monthlyLitresLimit < 0) {
+    return `No valid monthly fuel allocation exists for this vehicle for ${month}.`
+  }
+  const used = (Array.isArray(transactions) ? transactions : []).reduce((total, entry) => {
+    if (String(entry?.id) === String(excludeId) || entry?.type !== 'Credit Sale' ||
+      entry?.customerId !== sale.customerId || entry?.vehicleId !== sale.vehicleId || entry?.date?.slice(0, 7) !== month) return total
+    return total + Number(entry.litres || 0)
+  }, 0)
+  if (sale.litres > allocation.monthlyLitresLimit - used + 0.000001) {
+    return `This transaction exceeds the vehicle's remaining monthly fuel allocation of ${Math.max(0, allocation.monthlyLitresLimit - used)} L.`
+  }
+  return null
+}
+
+function writeFleetCreditTransaction(user, operation, sale, transaction, id) {
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    const salesState = storedValue('sales')
+    const ledgerState = storedValue('udhar-transactions')
+    const sales = Array.isArray(salesState.value) ? salesState.value : []
+    const ledger = Array.isArray(ledgerState.value) ? ledgerState.value : []
+    let nextSales
+    let nextLedger
+    let affectedCustomerIds = []
+
+    if (operation === 'delete') {
+      const matchingSales = sales.filter((item) => String(item?.id) === String(id))
+      const matchingLedger = ledger.filter((item) => String(item?.id) === String(id))
+      if (!matchingSales.length && !matchingLedger.length) {
+        db.exec('ROLLBACK')
+        return { missing: true }
+      }
+      if (matchingSales.length !== 1 || matchingLedger.length !== 1 || !sameFleetCreditPair(matchingSales[0], matchingLedger[0])) {
+        db.exec('ROLLBACK')
+        return { conflict: true, error: 'The linked sale and receivable are inconsistent. No records were changed.' }
+      }
+      affectedCustomerIds = [matchingLedger[0].customerId]
+      nextSales = sales.filter((item) => String(item?.id) !== String(id))
+      nextLedger = ledger.filter((item) => String(item?.id) !== String(id))
+    } else {
+      const matchingSales = sales.filter((item) => String(item?.id) === String(sale.id))
+      const matchingLedger = ledger.filter((item) => String(item?.id) === String(transaction.id))
+      const saleIndex = sales.findIndex((item) => String(item?.id) === String(sale.id))
+      const ledgerIndex = ledger.findIndex((item) => String(item?.id) === String(transaction.id))
+      const saleFields = ['id', 'date', 'product', 'litres', 'rate', 'amount', 'mode', 'customer', 'customerId', 'vehicleId', 'reference']
+      const ledgerFields = ['id', 'date', 'customerId', 'type', 'reference', 'description', 'debit', 'credit', 'vehicleId', 'fuelType', 'litres']
+
+      if (matchingSales.length > 1 || matchingLedger.length > 1) {
+        db.exec('ROLLBACK')
+        return { conflict: true, error: 'Duplicate transaction IDs already exist. No records were changed.' }
+      }
+      if (operation === 'create' && (matchingSales.length >= 1 || matchingLedger.length >= 1)) {
+        if (matchingSales.length === 1 && matchingLedger.length === 1 &&
+          fleetCreditRecordMatches(sales[saleIndex], sale, saleFields) &&
+          fleetCreditRecordMatches(ledger[ledgerIndex], transaction, ledgerFields) &&
+          sameFleetCreditPair(sales[saleIndex], ledger[ledgerIndex])) {
+          db.exec('ROLLBACK')
+          return { alreadyApplied: true, sales, transactions: ledger, versions: { sales: salesState.version, 'udhar-transactions': ledgerState.version } }
+        }
+        db.exec('ROLLBACK')
+        return { conflict: true, error: 'This transaction ID is already in use or has only one linked record.' }
+      }
+      if (operation === 'update' && (matchingSales.length !== 1 || matchingLedger.length !== 1 || !sameFleetCreditPair(sales[saleIndex], ledger[ledgerIndex]))) {
+        db.exec('ROLLBACK')
+        return { conflict: true, error: 'The linked sale and receivable could not both be found. No records were changed.' }
+      }
+      if (operation === 'create' && (saleIndex >= 0 || ledgerIndex >= 0) ||
+        operation === 'update' && (saleIndex < 0 || ledgerIndex < 0)) {
+        db.exec('ROLLBACK')
+        return { conflict: true, error: 'The linked sale and receivable are inconsistent. No records were changed.' }
+      }
+      const invalid = validateFleetCreditPair(
+        sale,
+        transaction,
+        storedValue('fleet-allocations').value,
+        storedValue('fleet-vehicles').value,
+        storedValue('customers').value,
+        ledger,
+        operation === 'update' ? sale.id : null,
+      )
+      if (invalid) {
+        db.exec('ROLLBACK')
+        return { invalid }
+      }
+      if (operation === 'update' &&
+        fleetCreditRecordMatches(sales[saleIndex], sale, saleFields) &&
+        fleetCreditRecordMatches(ledger[ledgerIndex], transaction, ledgerFields)) {
+        db.exec('ROLLBACK')
+        return { alreadyApplied: true, sales, transactions: ledger, versions: { sales: salesState.version, 'udhar-transactions': ledgerState.version } }
+      }
+      if (operation === 'update') affectedCustomerIds = [ledger[ledgerIndex].customerId, transaction.customerId]
+      nextSales = operation === 'create'
+        ? [sale, ...sales]
+        : sales.map((item) => String(item?.id) === String(sale.id) ? sale : item)
+      nextLedger = operation === 'create'
+        ? [transaction, ...ledger]
+        : ledger.map((item) => String(item?.id) === String(transaction.id) ? transaction : item)
+    }
+
+    for (const customerId of new Set(affectedCustomerIds)) {
+      const balance = (entries) => entries
+        .filter((entry) => entry?.customerId === customerId)
+        .reduce((total, entry) => total + Number(entry?.debit || 0) - Number(entry?.credit || 0), 0)
+      const previousBalance = balance(ledger)
+      const nextBalance = balance(nextLedger)
+      if (nextBalance < previousBalance - 0.000001 && nextBalance < -0.000001) {
+        db.exec('ROLLBACK')
+        return { conflict: true, error: 'This change would create a customer credit balance because payments or adjustments already offset the receivable.' }
+      }
+    }
+
+    const versions = {}
+    for (const [key, value, current] of [
+      ['sales', nextSales, salesState],
+      ['udhar-transactions', nextLedger, ledgerState],
+    ]) {
+      const version = current.version + 1
+      db.prepare(`INSERT INTO register_state (key, value_json, updated_at, updated_by, version)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at,
+        updated_by = excluded.updated_by, version = excluded.version`).run(key, JSON.stringify(value), new Date().toISOString(), user.id, version)
+      audit(user, operation === 'delete' ? 'delete' : operation, `${key}:${operation === 'delete' ? id : sale.id}`)
+      versions[key] = version
+    }
+    db.exec('COMMIT')
+    return { sales: nextSales, transactions: nextLedger, versions, alreadyApplied: false }
+  } catch (error) {
+    try { db.exec('ROLLBACK') } catch { /* Preserve the original write error. */ }
+    throw error
+  }
+}
+
 function advanceVersionsAfterRestore(user, previousVersions) {
   db.exec('BEGIN IMMEDIATE')
   try {
@@ -349,6 +523,68 @@ function deleteRegisterRecord(user, key, id) {
     return { version }
   } catch (error) {
     try { db.exec('ROLLBACK') } catch { /* Preserve the original delete error. */ }
+    throw error
+  }
+}
+
+function removeCustomerFromRegister(user, id) {
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    const customers = storedValue('customers')
+    if (!Array.isArray(customers.value)) {
+      db.exec('ROLLBACK')
+      return { missing: true }
+    }
+    const customer = customers.value.find((entry) => String(entry?.id) === String(id) && entry?.active !== false)
+    if (!customer) {
+      db.exec('ROLLBACK')
+      return { missing: true }
+    }
+
+    const transactions = storedValue('udhar-transactions').value
+    const customerTransactions = Array.isArray(transactions)
+      ? transactions.filter((entry) => String(entry?.customerId) === String(id))
+      : []
+    const hasOpeningEntry = customerTransactions.some((entry) => entry?.type === 'Opening Balance')
+    const transactionBalance = customerTransactions.reduce((sum, entry) => {
+      const debit = Number(entry?.debit ?? 0)
+      const credit = Number(entry?.credit ?? 0)
+      return sum + (Number.isFinite(debit) && Number.isFinite(credit) ? debit - credit : Number.NaN)
+    }, 0)
+    const openingBalance = Number(customer.openingBalance ?? 0)
+    const outstanding = (hasOpeningEntry ? 0 : openingBalance) + transactionBalance
+    if (!Number.isFinite(openingBalance) || !Number.isFinite(outstanding)) {
+      db.exec('ROLLBACK')
+      return { invalidBalance: true }
+    }
+    if (Math.abs(outstanding) > 0.000001) {
+      db.exec('ROLLBACK')
+      return { outstanding }
+    }
+
+    const linkedKeys = ['sales', 'discount-rules', 'family-adjustments', 'fleet-vehicles', 'fleet-allocations']
+    const hasLinkedRecords = linkedKeys.some((key) => {
+      const value = storedValue(key).value
+      return Array.isArray(value) && value.some((entry) =>
+        String(entry?.customerId) === String(id) ||
+        String(entry?.companyId) === String(id) ||
+        (key === 'sales' && entry?.mode === 'Credit' && entry?.customer === customer.name))
+    })
+    const archived = customerTransactions.length > 0 || hasLinkedRecords
+    const updated = archived
+      ? customers.value.map((entry) => String(entry?.id) === String(id) ? { ...entry, active: false } : entry)
+      : customers.value.filter((entry) => String(entry?.id) !== String(id))
+    const version = customers.version + 1
+    db.prepare(`INSERT INTO register_state (key, value_json, updated_at, updated_by, version)
+      VALUES ('customers', ?, ?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at,
+      updated_by = excluded.updated_by, version = excluded.version`)
+      .run(JSON.stringify(updated), new Date().toISOString(), user.id, version)
+    audit(user, archived ? 'archive' : 'delete', `customers:${id}`)
+    db.exec('COMMIT')
+    return { version, archived }
+  } catch (error) {
+    try { db.exec('ROLLBACK') } catch { /* Preserve the original customer removal error. */ }
     throw error
   }
 }
@@ -568,6 +804,29 @@ const server = createServer(async (request, response) => {
       }
     }
 
+    if (url.pathname === '/api/fleet-credit-transactions' && request.method === 'POST') {
+      if (!roleCanAccessKey(user, 'sales', 'write') || !roleCanAccessKey(user, 'udhar-transactions', 'write')) {
+        return send(request, response, 403, { error: 'This role cannot create or update fleet credit transactions.' })
+      }
+      const input = await body(request)
+      if (!['create', 'update'].includes(input.operation)) return send(request, response, 400, { error: 'A create or update operation is required.' })
+      const result = writeFleetCreditTransaction(user, input.operation, input.sale, input.transaction)
+      if (result.invalid) return send(request, response, 400, { error: result.invalid })
+      if (result.conflict) return send(request, response, 409, { error: result.error })
+      return send(request, response, 200, result)
+    }
+
+    if (request.method === 'DELETE' && url.pathname.startsWith('/api/fleet-credit-transactions/')) {
+      if (!roleCanAccessKey(user, 'sales', 'delete') || !roleCanAccessKey(user, 'udhar-transactions', 'delete')) {
+        return send(request, response, 403, { error: 'Manager or administrator role required to delete fleet credit transactions.' })
+      }
+      const id = decodeURIComponent(url.pathname.slice('/api/fleet-credit-transactions/'.length))
+      const result = writeFleetCreditTransaction(user, 'delete', null, null, id)
+      if (result.missing) return send(request, response, 404, { error: 'Fleet credit transaction not found.' })
+      if (result.conflict) return send(request, response, 409, { error: result.error })
+      return send(request, response, 200, result)
+    }
+
     if (request.method === 'DELETE' && url.pathname.startsWith('/api/sales/')) {
       if (!requireBackupRole(user)) return send(request, response, 403, { error: 'Manager or administrator role required.' })
       const id = decodeURIComponent(url.pathname.slice('/api/sales/'.length))
@@ -585,29 +844,11 @@ const server = createServer(async (request, response) => {
     if (request.method === 'DELETE' && url.pathname.startsWith('/api/customers/')) {
       if (!requireBackupRole(user)) return send(request, response, 403, { error: 'Manager or administrator role required.' })
       const id = decodeURIComponent(url.pathname.slice('/api/customers/'.length))
-      const customers = storedValue('customers').value
-      const customer = Array.isArray(customers) ? customers.find((entry) => String(entry?.id) === id) : null
-      if (!customer) return send(request, response, 404, { error: 'Customer not found.' })
-      const transactions = storedValue('udhar-transactions').value
-      const customerTransactions = Array.isArray(transactions) ? transactions.filter((entry) => String(entry?.customerId) === id) : []
-      const transactionBalance = customerTransactions.reduce((sum, entry) => sum + Number(entry?.debit || 0) - Number(entry?.credit || 0), 0)
-      const hasOpeningEntry = customerTransactions.some((entry) => entry?.type === 'Opening Balance')
-      const outstanding = hasOpeningEntry ? transactionBalance : Number(customer.openingBalance || 0) + transactionBalance
-      const linkedKeys = ['sales', 'discount-rules', 'family-adjustments', 'fleet-vehicles', 'fleet-allocations']
-      const hasLinkedRecords = linkedKeys.some((key) => {
-        const value = storedValue(key).value
-        return Array.isArray(value) && value.some((entry) =>
-          String(entry?.customerId) === id ||
-          String(entry?.companyId) === id ||
-          (key === 'sales' && entry?.mode === 'Credit' && entry?.customer === customer.name))
-      })
-      if (outstanding > 0) return send(request, response, 409, { error: 'Customer has an outstanding balance and cannot be deleted.' })
-      if (customerTransactions.length || hasLinkedRecords) {
-        return send(request, response, 409, { error: 'Customer has linked financial or historical records and cannot be deleted.' })
-      }
-      const result = deleteRegisterRecord(user, 'customers', id)
+      const result = removeCustomerFromRegister(user, id)
       if (result.missing) return send(request, response, 404, { error: 'Customer not found.' })
-      return send(request, response, 200, { ok: true, version: result.version })
+      if (result.invalidBalance) return send(request, response, 409, { error: 'Customer ledger balance is invalid; the record was not removed.' })
+      if (result.outstanding !== undefined) return send(request, response, 409, { error: 'Customer must have a zero balance before removal from the register.' })
+      return send(request, response, 200, { ok: true, archived: result.archived, version: result.version })
     }
 
     if (url.pathname.startsWith('/api/state/')) {
