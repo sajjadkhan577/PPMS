@@ -124,6 +124,17 @@ try {
   const operator = await login('operator-test', 'Operator-Password-123!')
   const manager = await login('manager-test', 'Manager-Password-123!')
 
+  let stationProfile = { businessName: 'Test Filling Station', branchName: 'North Branch', phone: '0300-0000000', address: 'Test Road' }
+  assert.equal((await request('/api/state/station-profile', { token: operator })).status, 200, 'Operators must be able to load station branding for display.')
+  assert.equal((await request('/api/state/station-profile', { token: manager })).status, 200, 'Managers must be able to load station branding for display.')
+  assert.equal((await request('/api/state/station-profile', { token: operator, method: 'PUT', body: { value: stationProfile, version: 0 } })).status, 403, 'Operators must not change station branding.')
+  assert.equal((await request('/api/state/station-profile', { token: manager, method: 'PUT', body: { value: stationProfile, version: 0 } })).status, 403, 'Managers must not change station branding.')
+  assert.equal((await request('/api/state/station-profile', { token: admin, method: 'PUT', body: { value: { ...stationProfile, businessName: ' ' }, version: 0 } })).status, 400, 'The server must reject a missing business name.')
+  const savedProfile = await request('/api/state/station-profile', { token: admin, method: 'PUT', body: { value: stationProfile, version: 0 } })
+  assert.equal(savedProfile.status, 200, `Administrator station-profile save failed: ${JSON.stringify(savedProfile.payload)}`)
+  assert.equal(savedProfile.payload.version, 1)
+  assert.deepEqual((await request('/api/state/station-profile', { token: operator })).payload.value, stationProfile, 'All roles must receive the persisted station profile.')
+
   assert.equal((await request('/api/state/bank-accounts', { token: operator })).status, 403, 'Operators must not read bank-account details.')
   assert.equal((await request('/api/state/employee-salaries', { token: manager })).status, 403, 'Managers must not read salaries.')
   assert.equal((await request('/api/users', { token: manager })).status, 403, 'User administration must be administrator-only.')
@@ -134,6 +145,11 @@ try {
   let saved = await request('/api/state/sales', { token: admin, method: 'PUT', body: { value: initialSales, version: 0 } })
   assert.equal(saved.status, 200, `Admin register save failed: ${JSON.stringify(saved.payload)}`)
   assert.equal(saved.payload.version, 1)
+  const profileBeforeUpdate = await request('/api/state/station-profile', { token: admin })
+  stationProfile = { ...stationProfile, businessName: 'Updated Test Filling Station' }
+  const updatedProfile = await request('/api/state/station-profile', { token: admin, method: 'PUT', body: { value: stationProfile, version: profileBeforeUpdate.payload.version } })
+  assert.equal(updatedProfile.status, 200, `Station-profile update failed: ${JSON.stringify(updatedProfile.payload)}`)
+  assert.deepEqual((await request('/api/state/sales', { token: admin })).payload.value, initialSales, 'Changing branding must not modify existing sales.')
   assert.equal((await request('/api/state/sales', { token: operator, method: 'PUT', body: { value: [], version: 1 } })).status, 403, 'Operators must not delete sales through generic register replacement.')
   assert.equal((await request('/api/sales/101', { token: operator, method: 'DELETE' })).status, 403, 'Operators must not delete a sale directly.')
   assert.equal((await request('/api/system/reset-registers', { token: operator, method: 'POST', body: { confirmation: 'RESET ALL REGISTER DATA' } })).status, 403)
@@ -213,6 +229,7 @@ try {
 
   const reset = await request('/api/system/reset-registers', { token: admin, method: 'POST', body: { confirmation: 'RESET ALL REGISTER DATA' } })
   assert.equal(reset.status, 200, `Authorized reset failed: ${JSON.stringify(reset.payload)}`)
+  assert.deepEqual((await request('/api/state/station-profile', { token: admin })).payload.value, stationProfile, 'Register reset must retain station branding.')
   const safetyPath = join(backupDirectory, 'Safety', reset.payload.safetyBackup)
   assert.ok(existsSync(safetyPath), 'Reset safety backup must exist.')
   const safetySnapshot = inspectDatabase(safetyPath)
@@ -254,10 +271,13 @@ try {
   assert.equal(deniedRegisterRestore.status, 403)
   const invalidRegisterRestore = await request('/api/system/restore-registers', { token: admin, method: 'POST', body: { backup: '{}' } })
   assert.equal(invalidRegisterRestore.status, 400, 'Register restore must retain backup validation.')
+  const invalidProfileBackup = JSON.stringify({ version: 1, createdAt: new Date().toISOString(), data: { 'station-profile': { businessName: ' ' } } })
+  assert.equal((await request('/api/system/restore-registers', { token: admin, method: 'POST', body: { backup: invalidProfileBackup } })).status, 400, 'Register restore must validate station profile data.')
   const preRegisterRestore = await request('/api/state/sales', { token: admin })
   const registerBackup = JSON.stringify({ version: 1, createdAt: new Date().toISOString(), data: { sales: [{ id: 404, date: '2026-10-04', product: 'PMG', litres: 2, rate: 3, amount: 6, mode: 'Cash', customer: '-' }] } })
   const restoredRegisters = await request('/api/system/restore-registers', { token: admin, method: 'POST', body: { backup: registerBackup } })
   assert.equal(restoredRegisters.status, 200)
+  assert.deepEqual((await request('/api/state/station-profile', { token: admin })).payload.value, stationProfile, 'Register restore without branding must leave the existing station profile intact.')
   assert.equal((await request('/api/state/sales', { token: admin, method: 'PUT', body: { value: [], version: preRegisterRestore.payload.version } })).status, 409, 'Register restore must advance versions so stale clients cannot overwrite restored data.')
   assert.deepEqual((await request('/api/state/sales', { token: admin })).payload.value.map((sale) => sale.id), [404])
 
@@ -266,7 +286,12 @@ try {
   assert.equal((await request('/api/auth/me', { token: operator })).status, 401, 'Logout must invalidate the session.')
   assert.equal((await request('/api/auth/me', { token: admin })).status, 200, 'Administrator login must remain valid.')
 
-  console.log('Security API regression tests passed: authorization, customer/sale deletion, version conflicts, reset safety, backup failure, restore, login, and logout.')
+  await stopServer()
+  await startServer()
+  const restartedAdmin = await login('admin', startupPassword)
+  assert.deepEqual((await request('/api/state/station-profile', { token: restartedAdmin })).payload.value, stationProfile, 'Station profile must persist across server restarts.')
+
+  console.log('Security API regression tests passed: station-profile authorization/persistence, authorization, customer/sale deletion, version conflicts, reset safety, backup failure, restore, login, and logout.')
 } finally {
   try {
     await stopServer()

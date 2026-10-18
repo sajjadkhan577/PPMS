@@ -115,6 +115,10 @@ async function createWindow() {
       },
     })
     mainWindow.setMenuBarVisibility(false)
+    mainWindow.webContents.on('page-title-updated', (event, title) => {
+      event.preventDefault()
+      mainWindow?.setTitle(title)
+    })
     mainWindow.webContents.on('render-process-gone', (_event, details) => log(`renderer exited: ${details.reason} code=${details.exitCode}`))
     if (app.isPackaged) mainWindow.webContents.on('before-input-event', (event, input) => {
       if (input.type === 'keyDown' && (input.key === 'F12' || input.control && input.shift && input.key.toLowerCase() === 'i')) event.preventDefault()

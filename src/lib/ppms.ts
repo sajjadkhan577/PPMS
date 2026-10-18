@@ -97,6 +97,32 @@ export type FuelStockSummaryInput = {
 
 export type FuelProduct = 'HSD' | 'PMG' | 'XTRON'
 
+export type StationProfile = {
+  businessName: string
+  branchName: string
+  phone: string
+  address: string
+}
+
+export const DEFAULT_STATION_PROFILE: StationProfile = {
+  businessName: 'EKHWAN - 1 Filling Station',
+  branchName: '',
+  phone: '',
+  address: '',
+}
+
+export function normalizeStationProfile(value: unknown): StationProfile {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return { ...DEFAULT_STATION_PROFILE }
+  const profile = value as Partial<StationProfile>
+  const stringValue = (field: unknown) => typeof field === 'string' ? field.trim() : ''
+  return {
+    businessName: stringValue(profile.businessName) || DEFAULT_STATION_PROFILE.businessName,
+    branchName: stringValue(profile.branchName),
+    phone: stringValue(profile.phone),
+    address: stringValue(profile.address),
+  }
+}
+
 export type FuelInventoryValuation = {
   openingInventoryValue: number | null
   netPurchasesAndEligibleAcquisitionCosts: number

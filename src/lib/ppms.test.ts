@@ -21,10 +21,28 @@ import {
   calculateMeterPeriodSummary,
   getMeterTestsForReading,
   calculateFuelCostOfGoodsSold,
+  DEFAULT_STATION_PROFILE,
+  normalizeStationProfile,
   type FuelCogsInput,
 } from './ppms'
 
 describe('petrol pump accounting logic', () => {
+  it('provides stable station branding defaults and normalizes saved profiles', () => {
+    expect(normalizeStationProfile(null)).toEqual(DEFAULT_STATION_PROFILE)
+    expect(normalizeStationProfile({
+      businessName: '  Example Fuels  ',
+      branchName: '  North Branch ',
+      phone: '  0300-0000000 ',
+      address: '  Main Road ',
+    })).toEqual({
+      businessName: 'Example Fuels',
+      branchName: 'North Branch',
+      phone: '0300-0000000',
+      address: 'Main Road',
+    })
+    expect(normalizeStationProfile({ businessName: '', branchName: 123 })).toEqual(DEFAULT_STATION_PROFILE)
+  })
+
   it('calculates meter totals correctly', () => {
     expect(calculateMeterTotal(12500, 11800)).toBe(700)
     expect(calculateMeterTotal(101500, 100000)).toBe(1500)

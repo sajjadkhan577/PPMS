@@ -21,9 +21,10 @@ const monthlyBackupDir = join(backupDir, 'Monthly')
 const safetyBackupDir = join(backupDir, 'Safety')
 const adminPassword = process.env.PPMS_ADMIN_PASSWORD
 const legacyDatabasePaths = String(process.env.PPMS_LEGACY_DB_PATHS || '').split(process.platform === 'win32' ? ';' : ':').filter(Boolean)
-const allowedKeys = new Set(['meters', 'meter-calibrations', 'sales', 'customers', 'udhar-transactions', 'expenses', 'employee-salaries', 'purchases', 'oil-sales', 'commission-records', 'discount-rules', 'payment-fees', 'stock-adjustments', 'stock-openings', 'bank-accounts', 'brs-records', 'family-adjustments', 'fleet-vehicles', 'fleet-allocations'])
+const allowedKeys = new Set(['station-profile', 'meters', 'meter-calibrations', 'sales', 'customers', 'udhar-transactions', 'expenses', 'employee-salaries', 'purchases', 'oil-sales', 'commission-records', 'discount-rules', 'payment-fees', 'stock-adjustments', 'stock-openings', 'bank-accounts', 'brs-records', 'family-adjustments', 'fleet-vehicles', 'fleet-allocations'])
 const managerAdminKeys = new Set(['commission-records', 'discount-rules', 'payment-fees', 'bank-accounts', 'brs-records', 'family-adjustments', 'stock-openings'])
 const adminOnlyKeys = new Set(['employee-salaries'])
+const adminWriteKeys = new Set(['station-profile'])
 const sessions = new Map()
 const requiredTables = ['users', 'register_state', 'audit_log']
 
@@ -222,10 +223,21 @@ function requireBackupRole(user, destructive = false) {
 
 function roleCanAccessKey(user, key, operation) {
   if (adminOnlyKeys.has(key)) return user.role === 'admin'
+  if (adminWriteKeys.has(key) && operation === 'write') return user.role === 'admin'
   if (managerAdminKeys.has(key)) return user.role === 'admin' || user.role === 'manager'
   return operation === 'delete'
     ? user.role === 'admin' || user.role === 'manager'
     : ['admin', 'manager', 'operator'].includes(user.role)
+}
+
+function validateStationProfile(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const fields = ['businessName', 'branchName', 'phone', 'address']
+  if (fields.some((field) => value[field] !== undefined && typeof value[field] !== 'string')) return null
+  const profile = Object.fromEntries(fields.map((field) => [field, String(value[field] || '').trim()]))
+  if (!profile.businessName || profile.businessName.length > 120 ||
+    profile.branchName.length > 120 || profile.phone.length > 40 || profile.address.length > 300) return null
+  return profile
 }
 
 function storedValue(key) {
@@ -771,7 +783,7 @@ const server = createServer(async (request, response) => {
       const safetyPath = join(safetyBackupDir, safetyName)
       try {
         copyVerifiedBackup(safetyPath)
-        const resetValues = Object.fromEntries([...allowedKeys].map((key) => [key, key === 'stock-openings' ? { HSD: 0, PMG: 0, XTRON: 0 } : []]))
+        const resetValues = Object.fromEntries([...allowedKeys].map((key) => [key, key === 'stock-openings' ? { HSD: 0, PMG: 0, XTRON: 0 } : key === 'station-profile' ? storedValue(key).value : []]))
         writeRegisterValues(user, resetValues, true)
         return send(request, response, 200, { ok: true, safetyBackup: safetyName })
       } catch (error) {
@@ -792,6 +804,12 @@ const server = createServer(async (request, response) => {
         return send(request, response, 400, { error: 'Register backup data is invalid.' })
       }
       const values = Object.entries(parsedBackup.data).filter(([key]) => allowedKeys.has(key))
+      const profileEntry = values.find(([key]) => key === 'station-profile')
+      if (profileEntry) {
+        const profile = validateStationProfile(profileEntry[1])
+        if (!profile) return send(request, response, 400, { error: 'Station profile in the register backup is invalid.' })
+        profileEntry[1] = profile
+      }
       const safetyName = `PPMS_PreRegisterRestore_${new Date().toISOString().slice(0, 19).replace('T', '_').replaceAll(':', '-')}.db`
       const safetyPath = join(safetyBackupDir, safetyName)
       try {
@@ -862,7 +880,12 @@ const server = createServer(async (request, response) => {
         if (!roleCanAccessKey(user, key, 'write')) return send(request, response, 403, { error: 'This role cannot modify this register.' })
         const input = await body(request)
         if (!Number.isInteger(input.version)) return send(request, response, 428, { error: 'A register version is required. Reload the register and try again.' })
-        const result = writeRegister(user, key, input.value, input.version)
+        let value = input.value
+        if (key === 'station-profile') {
+          value = validateStationProfile(value)
+          if (!value) return send(request, response, 400, { error: 'Provide a business name up to 120 characters, a branch name up to 120 characters, a phone up to 40 characters, and an address up to 300 characters.' })
+        }
+        const result = writeRegister(user, key, value, input.version)
         if (result.conflict) return send(request, response, 409, { error: 'This register changed after it was loaded. Reload it before saving.', value: result.value, version: result.version })
         if (result.guardedDelete) return send(request, response, 403, { error: 'Use the guarded delete operation for sales and customers.' })
         if (result.forbidden) return send(request, response, 403, { error: 'This role cannot delete register records.' })

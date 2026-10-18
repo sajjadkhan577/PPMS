@@ -29,6 +29,21 @@ describe('PPMS storage', () => {
     expect(readStored(restored, 'ppms-expenses', [])).toEqual([{ id: 2 }])
   })
 
+  it('includes the station profile in register backups without changing business registers', () => {
+    const profile = { businessName: 'Example Fuels', branchName: 'West', phone: '', address: '' }
+    const storage = memoryStorage({
+      'ppms-station-profile': JSON.stringify({ version: 1, data: profile }),
+      'ppms-sales': JSON.stringify([{ id: 1 }]),
+    })
+    const backup = createBackup(storage, ['ppms-station-profile', 'ppms-sales'])
+    const restored = memoryStorage()
+
+    restoreBackup(restored, backup, ['ppms-station-profile', 'ppms-sales'])
+
+    expect(readStored(restored, 'ppms-station-profile', null)).toEqual(profile)
+    expect(readStored(restored, 'ppms-sales', [])).toEqual([{ id: 1 }])
+  })
+
   it('rejects malformed backups', () => {
     expect(() => restoreBackup(memoryStorage(), '{"data": []}', ['ppms-sales'])).toThrow('Invalid PPMS backup file.')
   })
