@@ -631,6 +631,8 @@ export default function App() {
   const [printRequest, setPrintRequest] = useState<PrintDocumentRequest | null>(null)
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null)
   const [backups, setBackups] = useState<BackupInfo[]>([])
+  const [resetConfirmOpen, setResetConfirmOpen] = useState(false)
+  const [resetConfirmText, setResetConfirmText] = useState('')
   const [backupFilter, setBackupFilter] = useState<'All' | 'Daily' | 'Monthly' | 'Safety'>('All')
   const [monthlyBackupMonth, setMonthlyBackupMonth] = useState(currentSystemDate.slice(0, 7))
   const [backupMonth, setBackupMonth] = useState(currentSystemDate.slice(0, 7))
@@ -781,12 +783,13 @@ export default function App() {
     }).catch((error: Error) => flash(error.message || 'Backup restore failed. Select a valid PPMS backup file.'))
   }
   const resetRegisterData = async () => {
-    if (!window.confirm('This permanently clears all business register data while keeping user accounts. A verified safety backup will be created first.')) return
-    if (window.prompt('Type RESET ALL REGISTER DATA to confirm:') !== 'RESET ALL REGISTER DATA') return
+    if (resetConfirmText.trim() !== 'RESET ALL REGISTER DATA') return
     try {
       const result = await apiRequest<{ safetyBackup: string }>('/api/system/reset-registers', { method: 'POST', body: JSON.stringify({ confirmation: 'RESET ALL REGISTER DATA' }) })
+      setResetConfirmOpen(false)
+      setResetConfirmText('')
       flash(`Register data reset. Safety backup: ${result.safetyBackup}`)
-      window.setTimeout(() => window.location.reload(), 500)
+      window.setTimeout(() => window.location.reload(), 800)
     } catch (error) {
       flash((error as Error).message)
     }
@@ -2021,7 +2024,12 @@ export default function App() {
         <div className="section-heading"><h3>Offline Database and Backup</h3><span className="form-note">Local SQLite data</span></div>
         <div className="summary-strip"><strong>Database: {systemStatus?.databaseExists ? 'Connected' : 'Unavailable'}</strong><strong>Version: {systemStatus?.version || 'Loading'}</strong><strong>Backups: {backups.length}</strong></div>
         <p className="form-note">Database location: {systemStatus?.databasePath || 'Loading'}<br />Backup folder: {systemStatus?.backupDir || 'Loading'}</p>
-        {authUser?.role !== 'operator' && <div className="form-actions backup-actions"><button className="primary-button" type="button" onClick={backupDatabase}>Backup Database</button>{authUser?.role === 'admin' && <button className="ghost-button" type="button" onClick={createMonthlyBackup}>Create Monthly Backup</button>}<button className="ghost-button" type="button" onClick={downloadBackup}>Download Register Backup</button>{authUser?.role === 'admin' && <><label className="ghost-button backup-upload-button" htmlFor="register-backup-upload">Upload Register Backup</label><input id="register-backup-upload" className="backup-upload-input" type="file" accept=".json,application/json" onChange={(event) => { const file = event.target.files?.[0]; if (file) uploadBackup(file); event.currentTarget.value = '' }} /></>}{authUser?.role === 'admin' && <button className="danger-button" type="button" onClick={resetRegisterData}>Reset Register Data</button>}<button className="ghost-button" type="button" onClick={loadBackups}>Refresh Backups</button></div>}
+        {authUser?.role !== 'operator' && <div className="form-actions backup-actions"><button className="primary-button" type="button" onClick={backupDatabase}>Backup Database</button>{authUser?.role === 'admin' && <button className="ghost-button" type="button" onClick={createMonthlyBackup}>Create Monthly Backup</button>}<button className="ghost-button" type="button" onClick={downloadBackup}>Download Register Backup</button>{authUser?.role === 'admin' && <><label className="ghost-button backup-upload-button" htmlFor="register-backup-upload">Upload Register Backup</label><input id="register-backup-upload" className="backup-upload-input" type="file" accept=".json,application/json" onChange={(event) => { const file = event.target.files?.[0]; if (file) uploadBackup(file); event.currentTarget.value = '' }} /></>}{authUser?.role === 'admin' && <button className="danger-button" type="button" onClick={() => { setResetConfirmOpen((open) => !open); setResetConfirmText('') }}>Reset Register Data</button>}<button className="ghost-button" type="button" onClick={loadBackups}>Refresh Backups</button></div>}
+        {authUser?.role === 'admin' && resetConfirmOpen && <div className="reset-confirmation">
+          <p>This permanently clears all business register data, keeps user accounts, and creates a verified safety backup first.</p>
+          <label className="form-field"><span>Type RESET ALL REGISTER DATA to continue</span><input name="resetConfirmation" value={resetConfirmText} onChange={(event) => setResetConfirmText(event.target.value)} autoComplete="off" /></label>
+          <div className="form-actions"><button className="danger-button" type="button" onClick={resetRegisterData} disabled={resetConfirmText.trim() !== 'RESET ALL REGISTER DATA'}>Confirm Reset</button><button className="ghost-button" type="button" onClick={() => { setResetConfirmOpen(false); setResetConfirmText('') }}>Cancel</button></div>
+        </div>}
         <div className="period-controls backup-filters"><label className="form-field"><span>Backup Type</span><select value={backupFilter} onChange={(event) => setBackupFilter(event.target.value as 'All' | 'Daily' | 'Monthly' | 'Safety')}><option>All</option><option>Daily</option><option>Monthly</option><option>Safety</option></select></label><label className="form-field"><span>Monthly Backup Month</span><input type="month" value={monthlyBackupMonth} onChange={(event) => setMonthlyBackupMonth(event.target.value)} /></label><label className="form-field"><span>Month</span><input type="month" value={backupMonth} onChange={(event) => setBackupMonth(event.target.value)} /></label></div>
         <div className="table-wrap backup-table"><table><thead><tr><th>Date</th><th>Type</th><th>Backup</th><th>Size</th><th>Status</th><th>Action</th></tr></thead><tbody>{backups.filter((backup) => (backupFilter === 'All' || backup.type === backupFilter) && (!backupMonth || backup.name.includes(backupMonth))).length ? backups.filter((backup) => (backupFilter === 'All' || backup.type === backupFilter) && (!backupMonth || backup.name.includes(backupMonth))).map((backup) => <tr key={backup.name}><td>{new Date(backup.modifiedAt).toLocaleString()}</td><td>{backup.type}</td><td>{backup.name}</td><td>{Math.ceil(backup.size / 1024)} KB</td><td>Valid</td><td className="backup-row-actions">{authUser?.role === 'admin' && <><button className="table-action" type="button" onClick={() => restoreDatabase(backup.name)}>Restore</button><button className="table-action danger-link" type="button" onClick={() => deleteBackup(backup)}>Delete</button></>}</td></tr>) : <tr><td colSpan={6} className="empty-cell">No database backups found.</td></tr>}</tbody></table></div>
         <p className="form-note">Daily backups are retained until you delete them. Monthly backups are complete SQLite restore points. Restore always creates a safety backup first.</p>
