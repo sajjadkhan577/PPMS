@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process'
 import { createServer as createNetServer } from 'node:net'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -10,13 +10,50 @@ const projectRoot = resolve(import.meta.dirname, '..')
 const appRoot = process.env.PPMS_TEST_APP_ROOT || projectRoot
 const serverEntry = process.env.PPMS_TEST_SERVER_ENTRY || join(projectRoot, 'server.mjs')
 const workingDirectory = process.env.PPMS_TEST_CWD || projectRoot
-const sourceDatabase = process.env.PPMS_TEST_DB_SOURCE || process.env.PPMS_DB_SOURCE || join(projectRoot, 'data', 'ppms.sqlite')
 const tempRoot = mkdtempSync(join(tmpdir(), 'ppms-desktop-smoke-'))
 const dataDir = join(tempRoot, 'data')
 const backupDir = join(tempRoot, 'backups')
 const logDir = join(tempRoot, 'logs')
-const databasePath = join(dataDir, 'ppms.sqlite')
+let databasePath = join(dataDir, 'ppms.sqlite')
+const sourceDatabase = join(tempRoot, 'source', 'ppms.sqlite')
+let legacyDatabasePaths = sourceDatabase
+let expectedUsersReady = true
+let port
 const startupToken = 'desktop-smoke-test-token'
+
+function createMigrationFixture() {
+  mkdirSync(join(tempRoot, 'source'), { recursive: true })
+  const database = new DatabaseSync(sourceDatabase)
+  try {
+    database.exec(`
+      CREATE TABLE users (
+        id TEXT PRIMARY KEY,
+        username TEXT NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL CHECK (role IN ('admin', 'manager', 'operator')),
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE register_state (
+        key TEXT PRIMARY KEY,
+        value_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        updated_by TEXT NOT NULL
+      );
+      CREATE TABLE audit_log (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        action TEXT NOT NULL,
+        entity_key TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+    `)
+    database.prepare('INSERT INTO users (id, username, password_hash, role, active, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run('migration-fixture-user', 'admin', 'fixture-only', 'admin', 1, new Date().toISOString())
+  } finally {
+    database.close()
+  }
+}
 
 async function findPort() {
   const probe = createNetServer()
@@ -31,7 +68,7 @@ let childExit
 let stderr = ''
 
 async function startServer() {
-  const port = await findPort()
+  port = await findPort()
   const env = { ...process.env }
   delete env.PPMS_ADMIN_PASSWORD
   Object.assign(env, {
@@ -43,7 +80,7 @@ async function startServer() {
     PPMS_DB_PATH: databasePath,
     PPMS_BACKUP_DIR: backupDir,
     PPMS_LOG_DIR: logDir,
-    PPMS_LEGACY_DB_PATHS: sourceDatabase,
+    PPMS_LEGACY_DB_PATHS: legacyDatabasePaths,
     PPMS_VERSION: 'test',
   })
   child = spawn(process.execPath, [serverEntry], { cwd: workingDirectory, env, stdio: ['ignore', 'ignore', 'pipe'] })
@@ -68,7 +105,8 @@ async function startServer() {
     await delay(100)
   }
   if (!health) throw new Error(`Server health check timed out: ${lastError?.message || stderr}`)
-  if (health.service !== 'ppms-local-server' || health.startupToken !== startupToken || !health.usersReady) throw new Error('The local health handshake or existing-user check failed.')
+  if (health.service !== 'ppms-local-server' || health.startupToken !== startupToken || health.usersReady !== expectedUsersReady) throw new Error('The local health handshake or user-setup state check failed.')
+  if (!expectedUsersReady && !health.setupRequired) throw new Error('An empty desktop installation did not request first-run administrator setup.')
   const uiResponse = await fetch(`http://127.0.0.1:${port}/`)
   const uiHtml = await uiResponse.text()
   if (!uiResponse.ok || !uiHtml.includes('Petrol Pump Management System')) throw new Error('The local UI was not served from the configured application root.')
@@ -95,6 +133,7 @@ async function stopServer() {
 }
 
 try {
+  createMigrationFixture()
   await startServer()
   const database = new DatabaseSync(databasePath, { readOnly: true })
   const integrity = database.prepare('PRAGMA integrity_check').get()?.integrity_check
@@ -110,7 +149,47 @@ try {
   reopened.close()
   if (reopenedUsers !== users || reopenedStates !== registerStates) throw new Error('Database state changed after server restart.')
   await stopServer()
-  console.log(`Desktop server smoke test passed: migration, health handshake, clean restart, integrity, ${users} accounts, ${registerStates} register states.`)
+
+  databasePath = join(tempRoot, 'fresh-install', 'data', 'ppms.sqlite')
+  legacyDatabasePaths = ''
+  expectedUsersReady = false
+  await startServer()
+  const emptyDatabase = new DatabaseSync(databasePath, { readOnly: true })
+  try {
+    if (emptyDatabase.prepare('SELECT count(*) AS count FROM users').get().count !== 0 ||
+      emptyDatabase.prepare('SELECT count(*) AS count FROM register_state').get().count !== 0) {
+      throw new Error('A clean desktop installation must not contain seeded users or register data.')
+    }
+  } finally {
+    emptyDatabase.close()
+  }
+  const invalidSetup = await fetch(`http://127.0.0.1:${port}/api/auth/setup`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'first-admin', password: 'short' }),
+  })
+  if (invalidSetup.status !== 400) throw new Error('First-run setup must reject a weak administrator password.')
+  const setupResponse = await fetch(`http://127.0.0.1:${port}/api/auth/setup`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'first-admin', password: 'First-Run-Password-123!' }),
+  })
+  const setupPayload = await setupResponse.json()
+  if (setupResponse.status !== 201 || setupPayload.user?.role !== 'admin' || !setupPayload.token) throw new Error(`First-run administrator setup failed: ${JSON.stringify(setupPayload)}`)
+  const duplicateSetup = await fetch(`http://127.0.0.1:${port}/api/auth/setup`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'second-admin', password: 'Second-Run-Password-123!' }),
+  })
+  if (duplicateSetup.status !== 409) throw new Error('First-run setup must be disabled after an administrator account is created.')
+  const loginResponse = await fetch(`http://127.0.0.1:${port}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'first-admin', password: 'First-Run-Password-123!' }),
+  })
+  if (loginResponse.status !== 200) throw new Error('The first administrator could not sign in after setup.')
+  await stopServer()
+  console.log(`Desktop server smoke test passed: isolated legacy migration, server restart, clean empty-database startup, one-time administrator setup, and login (${users} migration-fixture account).`)
 } finally {
   try {
     await stopServer()

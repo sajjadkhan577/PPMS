@@ -1,11 +1,8 @@
 import { spawnSync } from 'node:child_process'
-import { rmdirSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const projectRoot = join(fileURLToPath(new URL('..', import.meta.url)))
-const seedDirectory = join(projectRoot, 'build-seed')
-const seedPath = join(seedDirectory, 'ppms.sqlite')
 
 function run(command, args) {
   const result = spawnSync(command, args, { cwd: projectRoot, stdio: 'inherit' })
@@ -15,7 +12,6 @@ function run(command, args) {
 
 let succeeded = false
 try {
-  run(process.execPath, [join(projectRoot, 'scripts', 'create-desktop-seed.mjs')])
   run(process.execPath, [join(projectRoot, 'node_modules', 'typescript', 'bin', 'tsc')])
   run(process.execPath, [join(projectRoot, 'node_modules', 'vite', 'bin', 'vite.js'), 'build'])
   run(process.execPath, [join(projectRoot, 'node_modules', 'electron-builder', 'cli.js'), '--win'])

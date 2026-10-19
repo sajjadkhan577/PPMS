@@ -41,7 +41,7 @@ describe('Electron runtime paths', () => {
     assert.equal(paths.databasePath, 'C:\\Users\\User\\AppData\\Roaming\\PPMS\\data\\ppms.sqlite')
   })
 
-  it('lists prior Electron and packaged seed databases as migration sources', () => {
+  it('lists prior Electron and install databases as migration sources', () => {
     const paths = resolveRuntimePaths({
       isPackaged: true,
       appPath: 'C:\\Program Files\\PPMS\\resources\\app',

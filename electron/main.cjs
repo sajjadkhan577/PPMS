@@ -35,6 +35,8 @@ function log(message) {
 
 function startServer() {
   const serverPath = path.join(paths.appRoot, 'server.mjs')
+  const serverEnvironment = { ...process.env }
+  if (app.isPackaged) delete serverEnvironment.PPMS_ADMIN_PASSWORD
   fs.mkdirSync(paths.databaseDir, { recursive: true })
   fs.mkdirSync(paths.backupDir, { recursive: true })
   fs.mkdirSync(paths.logDir, { recursive: true })
@@ -42,7 +44,7 @@ function startServer() {
   serverProcess = utilityProcess.fork(serverPath, [], {
     cwd: paths.appRoot,
     env: {
-      ...process.env,
+      ...serverEnvironment,
       PPMS_DESKTOP: app.isPackaged ? '1' : '0',
       PPMS_STARTUP_TOKEN: startupToken,
       PPMS_HOST: '127.0.0.1',
@@ -73,7 +75,6 @@ async function waitForServer() {
       if (response.ok) {
         const health = await response.json()
         if (health.service !== 'ppms-local-server' || health.startupToken !== startupToken) continue
-        if (app.isPackaged && !health.usersReady) throw new Error('no-users')
         return
       }
     } catch (error) {
@@ -85,7 +86,6 @@ async function waitForServer() {
 }
 
 function startupMessage(error) {
-  if (error.message === 'no-users') return 'No PPMS login accounts were found in the production database. The database was not replaced. Restore the existing database backup or configure PPMS_ADMIN_PASSWORD and restart.'
   if (error.message === 'server-exited' || error.message === 'server-timeout') return `The PPMS local service could not start on 127.0.0.1:${port}. Confirm that the port is available and review the local diagnostic log.`
   return 'PPMS could not open its database or start the local service. Existing database files were not replaced. Review the local diagnostic log.'
 }

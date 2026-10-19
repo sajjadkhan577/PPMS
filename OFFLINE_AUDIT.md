@@ -33,12 +33,12 @@ No app runtime `axios`, `XMLHttpRequest`, WebSocket, CDN script/style, remote fo
 ## Database Safety
 
 - Existing database files are never copied over an existing LocalAppData database.
-- On first packaged startup, if the target database does not exist, the server searches the prior Electron roaming `userData` location and then the verified package snapshot.
+- On first packaged startup, if the target database does not exist, the server searches supported prior-install database locations. New releases do not package a database seed.
 - Migration uses SQLite's online backup API so committed WAL content is included. It verifies integrity and required tables before opening the migrated target; the source remains intact.
-- If an existing target is invalid, or no usable packaged/legacy database is found, startup fails clearly instead of silently presenting a new empty database.
-- Windows package creation snapshots `data/ppms.sqlite` read-only into an ignored build staging directory, checks integrity and the presence of at least one login account, then includes the snapshot as a resource. The live database and its WAL are not placed in the writable install directory.
+- If no target or prior-install database exists, PPMS initializes an empty local database and provides a one-time administrator setup flow. Register data is never seeded with sample or developer records.
+- Windows package creation builds the UI and packages the whitelisted application files only. It does not inspect, snapshot, or include `data/ppms.sqlite`, its sidecars, backups, or the ignored `build-seed` folder.
 
-The Windows package is intended to carry the station's existing database snapshot. Treat the resulting installer as containing business data and distribute it only through the station's approved secure process.
+The Windows package contains application code only. Each installation creates or migrates its own database under `%LOCALAPPDATA%\PPMS\data`; different installations do not share data.
 
 ## Startup, Port, and Security
 
@@ -56,11 +56,9 @@ The end-user application does not require VS Code, Node.js, npm, source code, Gi
 
 The source audit confirms the application runtime uses only loopback requests and local assets.
 
-- `npm test`: 44 Vitest tests, 4 runtime-path tests, and the desktop-server migration/restart smoke test passed.
-- `npm run build`: passed.
-- `npm run dist:win`: produced `dist/PPMS Setup 1.0.0.exe` and `dist/win-unpacked/PPMS.exe` with the verified database resource.
-- The extracted packaged server was launched from a working directory outside its install tree using a temporary LocalAppData substitute. Migration, the exact health token, local UI serving, SQLite integrity, graceful stop/restart, and record counts passed.
-- Electron's embedded Node 22.19.0 exposes `node:sqlite` `DatabaseSync` and `backup`.
-- The GUI executable was not launched because an existing `node server.mjs` process owns fixed port 8787; it was not stopped. A physical Wi-Fi-disconnected Login-to-module session was not performed.
-
-These limits mean that offline runtime behavior is supported by source audit and local-server tests, but an actual disconnected Electron GUI session remains to be verified when port 8787 is available.
+- `npm test`: passed (64 Vitest tests, 4 Electron runtime-path tests, desktop-server migration/restart and clean-install setup smoke test, security API tests, and fleet-credit API tests). The desktop smoke test uses a temporary fixture database, not the project database.
+- `npx tsc --noEmit` and `npm run build`: passed.
+- `npm run dist:win`: built `release-build/PPMS Setup 1.0.0.exe` for Windows x64 using the configured NSIS target. The installer was 90,251,667 bytes and was not digitally signed.
+- The unpacked packaged app and release output were checked for `.sqlite`, `.db`, WAL, and SHM files; none were found. The installer was not launched.
+- The isolated desktop-server test verified an empty database starts without seeded users or register state, supports one-time administrator setup, rejects repeated setup, and then allows login.
+- The Electron GUI itself and an installed Windows session were not launched or visually tested. Offline Windows GUI operation remains supported by source/configuration and local API tests, but has not been verified by an actual GUI session in this task.

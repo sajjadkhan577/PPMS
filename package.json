@@ -37,6 +37,9 @@
     "appId": "com.ppms.station",
     "productName": "PPMS",
     "asar": false,
+    "directories": {
+      "output": "release-build"
+    },
     "files": [
       "dist/**/*",
       "server.mjs",
@@ -46,12 +49,6 @@
       "electron/ppms-icon.ico",
       "electron/ppms-icon.png",
       "package.json"
-    ],
-    "extraResources": [
-      {
-        "from": "build-seed/ppms.sqlite",
-        "to": "data/ppms.sqlite"
-      }
     ],
     "icon": "electron/ppms-icon.ico",
     "win": {

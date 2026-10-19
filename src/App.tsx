@@ -282,11 +282,37 @@ function useStored<T>(key: string, initial: T, normalize: (value: unknown) => T 
   return [value, setValue] as const
 }
 
-function LoginPanel({ onLogin, error }: { onLogin: (username: string, password: string) => void; error: string }) {
+function LoginPanel({ onLogin, onSetup, error }: { onLogin: (username: string, password: string) => void; onSetup: (username: string, password: string) => void; error: string }) {
   const [showPassword, setShowPassword] = useState(false)
   const passwordToggleLabel = showPassword ? 'Hide password' : 'Show password'
+  const [setupRequired, setSetupRequired] = useState(false)
+  const [localError, setLocalError] = useState('')
 
-  return <main className="login-panel"><div className="login-card"><span className="brand-mark">P</span><p className="eyebrow">Petrol Pump Management System</p><h1>Operator Sign In</h1><p>Use an authenticated PPMS account to access station registers.</p><form onSubmit={(event) => { event.preventDefault(); const data = new FormData(event.currentTarget); onLogin(String(data.get('username')), String(data.get('password'))) }}><label className="form-field"><span>Username</span><input name="username" autoComplete="username" required /></label><div className="form-field"><label htmlFor="login-password"><span>Password</span></label><div className="login-password-shell"><input id="login-password" className="login-password-input" name="password" type={showPassword ? 'text' : 'password'} autoComplete="current-password" required /><button className="login-password-toggle" type="button" aria-label={passwordToggleLabel} title={passwordToggleLabel} aria-pressed={showPassword} onClick={() => setShowPassword((visible) => !visible)}>{showPassword ? <svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><path d="M3 3l18 18M10.6 10.6a2 2 0 002.8 2.8" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/><path d="M9.9 5.2A10.8 10.8 0 0112 5c5.2 0 8.7 4.5 9.5 6-.3.6-1.2 1.8-2.7 3M6.2 6.2C3.9 7.7 2.5 10 2.5 11c.8 1.5 4.3 6 9.5 6 1 0 1.9-.2 2.8-.5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/></svg> : <svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6z" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round"/><circle cx="12" cy="12" r="2.5" stroke="currentColor" strokeWidth="1.8"/></svg>}</button></div></div>{error && <p className="form-error">{error}</p>}<button className="primary-button" type="submit">Sign In</button></form></div></main>
+  useEffect(() => {
+    apiRequest<{ setupRequired?: boolean }>('/api/health')
+      .then((health) => setSetupRequired(health.setupRequired === true))
+      .catch(() => setSetupRequired(false))
+  }, [])
+
+  return <main className="login-panel"><div className="login-card"><span className="brand-mark">P</span><p className="eyebrow">Petrol Pump Management System</p><h1>{setupRequired ? 'Set Up Administrator' : 'Operator Sign In'}</h1><p>{setupRequired ? 'Create the first administrator account for this local PPMS installation.' : 'Use an authenticated PPMS account to access station registers.'}</p><form onSubmit={(event) => {
+    event.preventDefault()
+    setLocalError('')
+    const data = new FormData(event.currentTarget)
+    const username = String(data.get('username'))
+    const password = String(data.get('password'))
+    if (setupRequired) {
+      if (password !== String(data.get('confirmPassword'))) return setLocalError('Passwords do not match.')
+      onSetup(username, password)
+    } else {
+      onLogin(username, password)
+    }
+  }}>
+    <label className="form-field"><span>Username</span><input name="username" autoComplete="username" defaultValue={setupRequired ? 'admin' : ''} minLength={setupRequired ? 3 : undefined} maxLength={50} required /></label>
+    <div className="form-field"><label htmlFor="login-password"><span>Password</span></label><div className="login-password-shell"><input id="login-password" className="login-password-input" name="password" type={showPassword ? 'text' : 'password'} autoComplete={setupRequired ? 'new-password' : 'current-password'} minLength={setupRequired ? 8 : undefined} maxLength={256} required /><button className="login-password-toggle" type="button" aria-label={passwordToggleLabel} title={passwordToggleLabel} aria-pressed={showPassword} onClick={() => setShowPassword((visible) => !visible)}>{showPassword ? <svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><path d="M3 3l18 18M10.6 10.6a2 2 0 002.8 2.8" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/><path d="M9.9 5.2A10.8 10.8 0 0112 5c5.2 0 8.7 4.5 9.5 6-.3.6-1.2 1.8-2.7 3M6.2 6.2C3.9 7.7 2.5 10 2.5 11c.8 1.5 4.3 6 9.5 6 1 0 1.9-.2 2.8-.5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/></svg> : <svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6z" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round"/><circle cx="12" cy="12" r="2.5" stroke="currentColor" strokeWidth="1.8"/></svg>}</button></div></div>
+    {setupRequired && <label className="form-field"><span>Confirm Password</span><input name="confirmPassword" type={showPassword ? 'text' : 'password'} autoComplete="new-password" minLength={8} maxLength={256} required /></label>}
+    {(localError || error) && <p className="form-error">{localError || error}</p>}
+    <button className="primary-button" type="submit">{setupRequired ? 'Create Administrator' : 'Sign In'}</button>
+  </form></div></main>
 }
 
 const money = (value: number) => `Rs. ${Math.round(value).toLocaleString('en-PK')}`
@@ -786,6 +812,14 @@ export default function App() {
   }
   const login = (username: string, password: string) => {
     apiRequest<{ token: string; user: SessionUser }>('/api/auth/login', { method: 'POST', body: JSON.stringify({ username, password }) }).then((payload) => {
+      localStorage.setItem('ppms-session-token', payload.token)
+      localStorage.setItem('ppms-session-user', JSON.stringify(payload.user))
+      setAuthUser(payload.user)
+      setAuthError('')
+    }).catch((error: Error) => setAuthError(error.message))
+  }
+  const setupAdministrator = (username: string, password: string) => {
+    apiRequest<{ token: string; user: SessionUser }>('/api/auth/setup', { method: 'POST', body: JSON.stringify({ username, password }) }).then((payload) => {
       localStorage.setItem('ppms-session-token', payload.token)
       localStorage.setItem('ppms-session-user', JSON.stringify(payload.user))
       setAuthUser(payload.user)
@@ -2223,7 +2257,7 @@ export default function App() {
     ) : <section className="register-section module-placeholder"><h3>{selectedTab}</h3><p>This module is ready for station configuration and its register workflow.</p></section>
 
   return (
-    !authUser ? <LoginPanel onLogin={login} error={authError} /> :
+    !authUser ? <LoginPanel onLogin={login} onSetup={setupAdministrator} error={authError} /> :
     <>
       {showChangeUsername && <div className="modal-overlay" onClick={() => { setShowChangeUsername(false); setChangeUsernameError('') }}>
         <div className="modal-card" onClick={(event) => event.stopPropagation()}>

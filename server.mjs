@@ -48,10 +48,7 @@ function databaseTables(database) {
 async function migrateLegacyDatabase() {
   if (existsSync(dbPath)) return
   const legacyPath = legacyDatabasePaths.find((candidate) => existsSync(candidate))
-  if (!legacyPath) {
-    if (desktopProduction) throw new Error(`The PPMS database was not found at ${dbPath}; no existing database was changed.`)
-    return
-  }
+  if (!legacyPath) return
 
   let source
   try {
@@ -127,7 +124,9 @@ if (!db.prepare('SELECT id FROM users LIMIT 1').get()) {
     db.prepare('INSERT INTO users (id, username, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)').run(randomUUID(), 'admin', hashPassword(adminPassword), 'admin', new Date().toISOString())
     writeLog('INFO', 'Initial admin account created from PPMS_ADMIN_PASSWORD.')
   } else {
-    writeLog('WARN', 'No PPMS users exist. Configure PPMS_ADMIN_PASSWORD or restore an existing PPMS database before login.')
+    writeLog('WARN', desktopProduction
+      ? 'No PPMS users exist. Complete the first-run administrator setup in the desktop application.'
+      : 'No PPMS users exist. Configure PPMS_ADMIN_PASSWORD before development login.')
   }
 }
 
@@ -613,10 +612,12 @@ const server = createServer(async (request, response) => {
     const url = new URL(request.url, `http://${request.headers.host || 'localhost'}`)
     if (request.method === 'OPTIONS') return send(request, response, 204, {})
     if (request.method === 'GET' && url.pathname === '/api/health') {
+      const usersReady = Boolean(db.prepare('SELECT id FROM users LIMIT 1').get())
       return send(request, response, 200, {
         service: 'ppms-local-server',
         startupToken: process.env.PPMS_STARTUP_TOKEN || '',
-        usersReady: Boolean(db.prepare('SELECT id FROM users LIMIT 1').get()),
+        usersReady,
+        setupRequired: desktopProduction && !usersReady,
       })
     }
     if (request.method === 'GET' && !url.pathname.startsWith('/api/')) {
@@ -627,6 +628,37 @@ const server = createServer(async (request, response) => {
         response.writeHead(200, { 'content-type': contentTypes[extname(filePath)] || 'application/octet-stream' })
         response.end(readFileSync(filePath))
         return
+      }
+    }
+    if (request.method === 'POST' && url.pathname === '/api/auth/setup') {
+      if (!desktopProduction) return send(request, response, 404, { error: 'First-run setup is available only in the packaged desktop application.' })
+      const input = await body(request)
+      const username = String(input.username || '').trim()
+      const password = String(input.password || '')
+      if (!/^[A-Za-z0-9._-]{3,50}$/.test(username)) return send(request, response, 400, { error: 'Username must be 3-50 characters and may contain letters, numbers, dots, underscores, or hyphens.' })
+      if (password.length < 8 || password.length > 256) return send(request, response, 400, { error: 'Password must be between 8 and 256 characters.' })
+      db.exec('BEGIN IMMEDIATE')
+      try {
+        if (db.prepare('SELECT id FROM users LIMIT 1').get()) {
+          db.exec('ROLLBACK')
+          return send(request, response, 409, { error: 'Initial administrator setup has already been completed. Sign in instead.' })
+        }
+        const id = randomUUID()
+        const createdAt = new Date().toISOString()
+        db.prepare('INSERT INTO users (id, username, password_hash, role, active, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+          .run(id, username, hashPassword(password), 'admin', 1, createdAt)
+        const user = { id, username, role: 'admin' }
+        audit(user, 'initial-admin-created', 'auth')
+        db.exec('COMMIT')
+        const token = randomBytes(32).toString('hex')
+        sessions.set(token, id)
+        return send(request, response, 201, { token, user })
+      } catch (error) {
+        try { db.exec('ROLLBACK') } catch { /* Preserve the setup failure. */ }
+        if (error instanceof Error && error.message.includes('UNIQUE constraint failed: users.username')) {
+          return send(request, response, 409, { error: 'That username is already in use.' })
+        }
+        throw error
       }
     }
     if (request.method === 'POST' && url.pathname === '/api/auth/login') {
